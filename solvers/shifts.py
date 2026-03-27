@@ -394,11 +394,16 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
                     switched = model.new_bool_var(f"switch_e{ei}_s{si}_d{di}")
                     model.add(x[ei][si][di] - x[ei][si][di + 1] <= switched)
                     shift_change_penalties.append(switched)
-        # Weight by consistency level (1 or 2)
-        objective_terms.append(sum(shift_change_penalties) * consistency)
+        # Weight by consistency level - repeat the list instead of multiply
+        # to avoid LinearExpr * int type issues in some OR-Tools versions
+        for _ in range(consistency):
+            for p in shift_change_penalties:
+                objective_terms.append(p)
 
     if objective_terms:
-        model.minimize(sum(objective_terms))
+        # Use OR-Tools LinearExpr.sum() to avoid Python sum() type issues
+        from ortools.sat.python.cp_model import LinearExpr
+        model.minimize(cp_model.LinearExpr.sum(objective_terms))
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     solver = cp_model.CpSolver()
@@ -407,8 +412,16 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
     solver.parameters.log_search_progress = False
 
     status = solver.solve(model)
-    status_name = solver.status_name(status)
-    logger.info(f"Solver status: {status_name} in {solver.wall_time:.2f}s")
+    _STATUS_NAMES = {
+        cp_model.UNKNOWN: 'UNKNOWN',
+        cp_model.MODEL_INVALID: 'MODEL_INVALID',
+        cp_model.FEASIBLE: 'FEASIBLE',
+        cp_model.INFEASIBLE: 'INFEASIBLE',
+        cp_model.OPTIMAL: 'OPTIMAL',
+    }
+    status_name = _STATUS_NAMES.get(status, f'STATUS_{status}')
+    solve_time = getattr(solver, 'wall_time', 0) or getattr(solver, 'WallTime', lambda: 0)()
+    logger.info(f"Solver status: {status_name} in {solve_time:.2f}s")
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         logger.warning(f"No feasible solution found: {status_name}")
@@ -427,7 +440,7 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
                 filled_slots=0,
                 hours_per_employee={e.id: 0.0 for e in employees},
                 solver_status=status_name,
-                solve_time_seconds=solver.wall_time,
+                solve_time_seconds=solve_time,
             )
         )
 
@@ -469,6 +482,6 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
             filled_slots=len(assignments),
             hours_per_employee=hours_per_employee,
             solver_status=status_name,
-            solve_time_seconds=solver.wall_time,
+            solve_time_seconds=solve_time,
         )
     )

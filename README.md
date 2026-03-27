@@ -28,12 +28,12 @@ railway init          # name it: orarpro-solver
 railway up
 
 # Get your URL
-railway domain        # e.g. https://orarpro-solver.up.railway.app
+railway domain        # e.g. https://orarpro-solver-production.up.railway.app
 ```
 
 Then add to Vercel environment variables:
 ```
-SOLVER_URL=https://orarpro-solver.up.railway.app
+SOLVER_URL=https://orarpro-solver-production.up.railway.app
 ```
 
 ## Environment Variables (Railway)
