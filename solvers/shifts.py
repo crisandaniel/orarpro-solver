@@ -141,16 +141,21 @@ def is_unavailable(employee_id: str, d: str, unavailability: list[dict]) -> bool
             return True
     return False
 
+def parse_time(t: str) -> tuple[int, int]:
+    """Parse HH:MM or HH:MM:SS into (hours, minutes)."""
+    parts = t.split(":")
+    return int(parts[0]), int(parts[1])
+
 def shift_end_hour(shift: ShiftDefinition) -> float:
     """End time as decimal hours, adjusted for midnight crossing."""
-    h, m = map(int, shift.end_time.split(":"))
+    h, m = parse_time(shift.end_time)
     end = h + m / 60
     if shift.crosses_midnight:
         end += 24
     return end
 
 def shift_start_hour(shift: ShiftDefinition) -> float:
-    h, m = map(int, shift.start_time.split(":"))
+    h, m = parse_time(shift.start_time)
     return h + m / 60
 
 def rest_hours_between(prev_shift: ShiftDefinition, prev_date: str,
