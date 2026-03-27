@@ -415,6 +415,7 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
     solver.parameters.max_time_in_seconds = payload.solver_time_limit_seconds
     solver.parameters.num_search_workers = 4  # parallel search
     solver.parameters.log_search_progress = False
+    solver.parameters.stop_after_first_solution = True # quicker but not optimised
 
     status = solver.solve(model)
     _STATUS_NAMES = {
