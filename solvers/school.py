@@ -310,30 +310,32 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                 if slots:
                     model.add(sum(slots) <= max_subj_day)
 
-    # ── Hard constraint 9: Start from first period ────────────────────────────
-    # If a class has ANY lesson on day d, it must have a lesson at period 0.
-    # Logic: has_any_lesson_on_day → has_lesson_at_period_0
-    # Equivalent: NOT has_lesson_at_period_0 → NOT has_any_lesson_on_day
-    # Which means: if period 0 is free, ALL other periods must also be free.
+    # ── Soft constraint: Start from first period ─────────────────────────────
+    # Penalize classes that have lessons on a day but NOT at period 0.
+    # Cannot be hard: multiple classes share the same teacher at period 0,
+    # so it's physically impossible for all of them to start at period 0.
+    # Instead: maximize the number of class-days that start at period 0.
+    start_penalties = []
     if cfg.start_from_first_period:
         for ci in range(C):
             for d in range(D):
                 at_zero = [v for (ti2, sui2, ci2, ri2, d2, p2), v in x.items()
                            if ci2 == ci and d2 == d and p2 == 0]
                 at_any  = [v for (ti2, sui2, ci2, ri2, d2, p2), v in x.items()
-                           if ci2 == ci and d2 == d]
+                           if ci2 == ci and d2 == d and p2 > 0]
                 if not at_zero or not at_any:
                     continue
                 has_zero = model.new_bool_var(f"has_zero_c{ci}_d{d}")
-                has_any  = model.new_bool_var(f"has_any_c{ci}_d{d}")
-                # has_zero = (sum(at_zero) >= 1)
+                has_later = model.new_bool_var(f"has_later_c{ci}_d{d}")
                 model.add(sum(at_zero) >= has_zero)
                 model.add(sum(at_zero) <= len(at_zero) * has_zero)
-                # has_any = (sum(at_any) >= 1)
-                model.add(sum(at_any) >= has_any)
-                model.add(sum(at_any) <= len(at_any) * has_any)
-                # has_any → has_zero (if class has lessons, must have one at period 0)
-                model.add(has_zero >= has_any)
+                model.add(sum(at_any) >= has_later)
+                model.add(sum(at_any) <= len(at_any) * has_later)
+                # Penalize: has lessons later in the day but not at period 0
+                gap = model.new_bool_var(f"gap_start_c{ci}_d{d}")
+                model.add_bool_and([has_later, has_zero.negated()]).only_enforce_if(gap)
+                model.add_bool_or([has_later.negated(), has_zero]).only_enforce_if(gap.negated())
+                start_penalties.append(gap)
 
     # ── Soft constraints ──────────────────────────────────────────────────────
     window_vars = []
