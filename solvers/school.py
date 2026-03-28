@@ -311,28 +311,29 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                     model.add(sum(slots) <= max_subj_day)
 
     # ── Hard constraint 9: Start from first period ────────────────────────────
-    # If enabled: class lessons on a given day must start at period 0 (no free periods at start)
-    # Implemented as: if period p has a lesson for class c on day d,
-    # then all periods 0..p-1 must also have lessons for class c on day d.
+    # If a class has ANY lesson on day d, it must have a lesson at period 0.
+    # Logic: has_any_lesson_on_day → has_lesson_at_period_0
+    # Equivalent: NOT has_lesson_at_period_0 → NOT has_any_lesson_on_day
+    # Which means: if period 0 is free, ALL other periods must also be free.
     if cfg.start_from_first_period:
         for ci in range(C):
             for d in range(D):
-                for p in range(1, P):
-                    # has_lesson_at_p: 1 if class ci has any lesson at (d, p)
-                    at_p = [v for (ti2, sui2, ci2, ri2, d2, p2), v in x.items()
-                            if ci2 == ci and d2 == d and p2 == p]
-                    at_prev = [v for (ti2, sui2, ci2, ri2, d2, p2), v in x.items()
-                               if ci2 == ci and d2 == d and p2 == p - 1]
-                    if not at_p or not at_prev:
-                        continue
-                    has_p    = model.new_bool_var(f"has_p_c{ci}_d{d}_p{p}")
-                    has_prev = model.new_bool_var(f"has_prev_c{ci}_d{d}_p{p}")
-                    model.add(sum(at_p) >= has_p)
-                    model.add(sum(at_p) <= has_p)
-                    model.add(sum(at_prev) >= has_prev)
-                    model.add(sum(at_prev) <= has_prev)
-                    # If lesson at p, must also have lesson at p-1
-                    model.add(has_prev >= has_p)
+                at_zero = [v for (ti2, sui2, ci2, ri2, d2, p2), v in x.items()
+                           if ci2 == ci and d2 == d and p2 == 0]
+                at_any  = [v for (ti2, sui2, ci2, ri2, d2, p2), v in x.items()
+                           if ci2 == ci and d2 == d]
+                if not at_zero or not at_any:
+                    continue
+                has_zero = model.new_bool_var(f"has_zero_c{ci}_d{d}")
+                has_any  = model.new_bool_var(f"has_any_c{ci}_d{d}")
+                # has_zero = (sum(at_zero) >= 1)
+                model.add(sum(at_zero) >= has_zero)
+                model.add(sum(at_zero) <= len(at_zero) * has_zero)
+                # has_any = (sum(at_any) >= 1)
+                model.add(sum(at_any) >= has_any)
+                model.add(sum(at_any) <= len(at_any) * has_any)
+                # has_any → has_zero (if class has lessons, must have one at period 0)
+                model.add(has_zero >= has_any)
 
     # ── Soft constraints ──────────────────────────────────────────────────────
     window_vars = []
@@ -388,6 +389,18 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     status = solver.solve(model)
     status_name = solver.status_name(status)
     logger.info(f"School solver status: {status_name} in {solver.wall_time:.2f}s")
+
+    # Debug: log key constraint counts to help diagnose infeasibility
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        logger.warning(f"INFEASIBLE debug:")
+        logger.warning(f"  Variables: {len(x)}")
+        logger.warning(f"  Classes: {[f'{c.name}:{class_subjects[i]}' for i, c in enumerate(classes)]}")
+        logger.warning(f"  Assignments periods: {dict(assignment_periods)}")
+        total_needed = sum(assignment_periods.get((ci, sui), subjects[sui].periods_per_week)
+                          for ci in range(C) for sui in class_subjects[ci])
+        total_slots = D * P * C
+        logger.warning(f"  Total lessons needed: {total_needed}, total slots: {total_slots}")
+        logger.warning(f"  start_from_first_period: {cfg.start_from_first_period}")
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return SchoolResponse(
