@@ -404,6 +404,91 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     obj_val     = solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None
 
     logger.info(f"  Status: {status_name} in {solver.wall_time:.2f}s obj={obj_val}")
+
+    # ── Identify which constraint causes INFEASIBLE ───────────────────────────
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        logger.warning("  Trying assumption-based diagnosis...")
+        # Test 1: remove soft objective — does it become feasible?
+        test_model = cp_model.CpModel()
+        # Rebuild only hard constraints (simplified)
+        tx = {}
+        for lesson in payload.lessons:
+            tx[lesson.id] = {}
+            for slot in lesson.allowed_slots:
+                tx[lesson.id][slot] = test_model.new_bool_var(f"t_{lesson.id[:6]}_{slot}")
+        # HARD 1
+        for lesson in payload.lessons:
+            test_model.add(sum(tx[lesson.id].values()) == 1)
+        # HARD 2: teacher
+        for teacher_id, lessons in teacher_lessons.items():
+            for d in range(D):
+                for p in range(P):
+                    vars_at = []
+                    for l in lessons:
+                        if f"{d}-{p}" in tx[l.id]: vars_at.append(tx[l.id][f"{d}-{p}"])
+                        if l.duration == 2 and p > 0 and f"{d}-{p-1}" in tx[l.id]:
+                            vars_at.append(tx[l.id][f"{d}-{p-1}"])
+                    if len(vars_at) > 1: test_model.add(sum(vars_at) <= 1)
+        # HARD 3: class
+        for class_id, lessons in class_lessons.items():
+            for d in range(D):
+                for p in range(P):
+                    vars_at = []
+                    for l in lessons:
+                        if f"{d}-{p}" in tx[l.id]: vars_at.append(tx[l.id][f"{d}-{p}"])
+                        if l.duration == 2 and p > 0 and f"{d}-{p-1}" in tx[l.id]:
+                            vars_at.append(tx[l.id][f"{d}-{p-1}"])
+                    if len(vars_at) > 1: test_model.add(sum(vars_at) <= 1)
+        # HARD 4: teacher max/day/week
+        for teacher_id, lessons in teacher_lessons.items():
+            tcfg = teacher_cfg.get(teacher_id)
+            if tcfg and tcfg.max_lessons_per_day:
+                for d in range(D):
+                    dv = [tx[l.id][s] for l in lessons for s in tx[l.id] if int(s.split('-')[0]) == d]
+                    if dv: test_model.add(sum(dv) <= tcfg.max_lessons_per_day)
+            if tcfg and tcfg.max_lessons_per_week:
+                aw = [v for l in lessons for v in tx[l.id].values()]
+                if aw: test_model.add(sum(aw) <= tcfg.max_lessons_per_week)
+        # HARD 5: class max/day
+        for class_id, lessons in class_lessons.items():
+            ccfg = class_cfg.get(class_id)
+            max_pd = ccfg.max_lessons_per_day if ccfg else P
+            for d in range(D):
+                dv = [tx[l.id][s] for l in lessons for s in tx[l.id] if int(s.split('-')[0]) == d]
+                if dv: test_model.add(sum(dv) <= max_pd)
+
+        test_solver = cp_model.CpSolver()
+        test_solver.parameters.max_time_in_seconds = 10
+        test_status = test_solver.solve(test_model)
+        if test_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            logger.warning("  DIAGNOSIS: Hard constraints ONLY → FEASIBLE. Problema e in soft constraints sau interactiunea lor.")
+        else:
+            logger.warning(f"  DIAGNOSIS: Hard constraints alone → {test_solver.status_name(test_status)}. Problema e in hard constraints.")
+            # Find which HARD constraint fails
+            # Test without HARD 4 (teacher max/day)
+            test2 = cp_model.CpModel()
+            tx2 = {}
+            for lesson in payload.lessons:
+                tx2[lesson.id] = {}
+                for slot in lesson.allowed_slots:
+                    tx2[lesson.id][slot] = test2.new_bool_var(f"t2_{lesson.id[:6]}_{slot}")
+            for lesson in payload.lessons:
+                test2.add(sum(tx2[lesson.id].values()) == 1)
+            for teacher_id, lessons in teacher_lessons.items():
+                for d in range(D):
+                    for p in range(P):
+                        vars_at = [tx2[l.id][f"{d}-{p}"] for l in lessons if f"{d}-{p}" in tx2[l.id]]
+                        if len(vars_at) > 1: test2.add(sum(vars_at) <= 1)
+            for class_id, lessons in class_lessons.items():
+                for d in range(D):
+                    for p in range(P):
+                        vars_at = [tx2[l.id][f"{d}-{p}"] for l in lessons if f"{d}-{p}" in tx2[l.id]]
+                        if len(vars_at) > 1: test2.add(sum(vars_at) <= 1)
+            t2s = test_solver.solve(test2)
+            if t2s in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                logger.warning("  DIAGNOSIS: Fara HARD4+5 → FEASIBLE. Problema e in max_lessons_per_day/week.")
+            else:
+                logger.warning("  DIAGNOSIS: Problema e in HARD1+2+3 (placement/teacher/class overlap).")
     debug_log.append({
         "type":         "solver_status",
         "status":       status_name,
