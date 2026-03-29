@@ -372,6 +372,26 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     if objective:
         model.minimize(sum(objective))
 
+    # ── Pre-solve sanity check ───────────────────────────────────────────────
+    # Log exact constraints per teacher to understand infeasibility
+    for teacher_id, lessons in teacher_lessons.items():
+        tname = next((t.name for t in payload.teachers if t.id == teacher_id), teacher_id[:8])
+        tcfg  = next((t for t in payload.teachers if t.id == teacher_id), None)
+        classes_for_teacher = {}
+        for l in lessons:
+            cname = next((c.name for c in payload.classes if c.id == l.class_id), l.class_id[:8])
+            classes_for_teacher[cname] = classes_for_teacher.get(cname, 0) + 1
+        total = len(lessons)
+        avail = len(set(s for l in lessons for s in l.allowed_slots))
+        max_pd = tcfg.max_lessons_per_day if tcfg and tcfg.max_lessons_per_day else P
+        max_pw = tcfg.max_lessons_per_week if tcfg and tcfg.max_lessons_per_week else "∞"
+        logger.info(
+            f"  [CHECK] {tname}: {total} lecții, {avail} sloturi avail, "
+            f"max {max_pd}/zi × {D}z = {max_pd*D} capacitate. "
+            f"Clase: {classes_for_teacher}. "
+            f"{'✓ OK' if total <= avail and total <= max_pd * D else '✗ IMPOSIBIL'}"
+        )
+
     # ── Solve ─────────────────────────────────────────────────────────────────
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = payload.solver_time_limit_seconds
@@ -467,8 +487,9 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
 def _analyze_infeasibility(payload, teacher_lessons, class_lessons, D, P):
     """
     Analiză detaliată a motivelor de infeasibility.
-    Folosește nume în loc de UUID-uri, verifică mai multe scenarii.
+    Folosește nume reale, verifică scenariile comune.
     """
+    from collections import defaultdict
     reasons = []
     total_slots = D * P
 
@@ -476,144 +497,132 @@ def _analyze_infeasibility(payload, teacher_lessons, class_lessons, D, P):
     teacher_names = {t.id: t.name for t in payload.teachers}
     class_names   = {c.id: c.name for c in payload.classes}
 
+    # Acumulează ore per profesor per clasă
+    teacher_hours:       dict[str, int]             = defaultdict(int)
+    teacher_class_hours: dict[str, dict[str, int]]  = defaultdict(lambda: defaultdict(int))
+    class_hours:         dict[str, int]             = defaultdict(int)
+
+    for lesson in payload.lessons:
+        cname = class_names.get(lesson.class_id, lesson.class_id[:8])
+        tname = teacher_names.get(lesson.teacher_id, lesson.teacher_id[:8])
+        teacher_hours[tname]             += 1
+        teacher_class_hours[tname][cname]+= 1
+        class_hours[cname]              += 1
+
     # ── 1. Lecții fără sloturi valide ────────────────────────────────────────
     for lesson in payload.lessons:
         if not x_has_slots(lesson, D, P):
             tname = teacher_names.get(lesson.teacher_id, lesson.teacher_id[:8])
             cname = class_names.get(lesson.class_id, lesson.class_id[:8])
-            unavail = len(payload.teachers[0].unavailable_slots) if payload.teachers else 0
-            reasons.append(
-                f"{tname} → {cname}: niciun slot valid disponibil"
-                + (f" (profesor are {unavail} sloturi indisponibile)" if unavail else "")
-            )
+            reasons.append(f"{tname} → {cname}: niciun slot valid disponibil")
 
-    # ── 2. Profesor supraîncărcat (ore/săpt) ─────────────────────────────────
+    # ── 2. Verificări per profesor ────────────────────────────────────────────
     for teacher_id, lessons in teacher_lessons.items():
-        tname = teacher_names.get(teacher_id, teacher_id[:8])
-        total = len(lessons)
-        tcfg  = next((t for t in payload.teachers if t.id == teacher_id), None)
+        tname  = teacher_names.get(teacher_id, teacher_id[:8])
+        total  = len(lessons)
+        tcfg   = next((t for t in payload.teachers if t.id == teacher_id), None)
+        max_pd = tcfg.max_lessons_per_day  if tcfg and tcfg.max_lessons_per_day  else P
+        max_pw = tcfg.max_lessons_per_week if tcfg and tcfg.max_lessons_per_week else None
 
-        if tcfg and tcfg.max_lessons_per_week and total > tcfg.max_lessons_per_week:
+        # a) Depășire normă săptămânală
+        if max_pw and total > max_pw:
             reasons.append(
-                f"{tname}: asignat {total} ore/săpt dar limita e {tcfg.max_lessons_per_week} ore/săpt"
+                f"{tname}: {total} ore/săpt depășește limita de {max_pw} ore/săpt"
             )
 
-        # Ore/zi imposibile
-        if tcfg and tcfg.max_lessons_per_day:
-            min_days_needed = -(-total // tcfg.max_lessons_per_day)  # ceil division
-            if min_days_needed > D:
-                reasons.append(
-                    f"{tname}: {total} ore cu max {tcfg.max_lessons_per_day}/zi necesită "
-                    f"cel puțin {min_days_needed} zile, dar săptămâna are doar {D}"
-                )
+        # b) Ore/zi medii depășesc max/zi
+        avg_per_day = total / D
+        if avg_per_day > max_pd:
+            reasons.append(
+                f"{tname}: {total} ore în {D} zile = {avg_per_day:.1f} ore/zi medie "
+                f"> limita {max_pd}/zi → imposibil de distribuit"
+            )
 
-        # Sloturi disponibile insuficiente (după excluderea indisponibilităților)
-        if tcfg:
-            available_slots = set()
-            for l in lessons:
-                available_slots.update(l.allowed_slots)
-            # Sloturi unice disponibile pentru profesor
-            if len(available_slots) < total:
-                reasons.append(
-                    f"{tname}: are nevoie de {total} sloturi distincte dar are doar "
-                    f"{len(available_slots)} sloturi disponibile (după indisponibilități)"
-                )
+        # c) Numărul de clase depășește max ore/zi
+        #    Profesorul trebuie să fie în fiecare clasă cel puțin 1 oră/zi
+        #    Deci are nevoie de minim 1 slot per clasă per zi → N clase = N ore/zi minim
+        n_classes = len(teacher_class_hours[tname])
+        if n_classes > max_pd:
+            reasons.append(
+                f"{tname}: predă la {n_classes} clase dar max {max_pd} ore/zi — "
+                f"nu poate fi în toate clasele zilnic. "
+                f"Soluție: mărește max ore/zi la ≥{n_classes} sau distribuie clasele la mai mulți profesori."
+            )
 
-    # ── 3. Clasă supraîncărcată ───────────────────────────────────────────────
+        # d) Sloturi disponibile insuficiente față de lecții
+        all_allowed: set[str] = set()
+        for l in lessons:
+            all_allowed.update(l.allowed_slots)
+        if len(all_allowed) < total:
+            reasons.append(
+                f"{tname}: {total} lecții dar doar {len(all_allowed)} sloturi disponibile "
+                f"după indisponibilități — imposibil să plaseze toate lecțiile"
+            )
+
+    # ── 3. Verificări per clasă ───────────────────────────────────────────────
     for class_id, lessons in class_lessons.items():
-        cname = class_names.get(class_id, class_id[:8])
-        total = len(lessons)
-        ccfg  = next((c for c in payload.classes if c.id == class_id), None)
+        cname  = class_names.get(class_id, class_id[:8])
+        total  = len(lessons)
+        ccfg   = next((c for c in payload.classes if c.id == class_id), None)
         max_pd = ccfg.max_lessons_per_day if ccfg else P
 
         if total > D * max_pd:
             reasons.append(
-                f"Clasa {cname}: {total} ore/săpt depășește capacitatea "
-                f"{D} zile × {max_pd} ore/zi = {D * max_pd} sloturi maxime"
-            )
-        elif total > total_slots:
-            reasons.append(
-                f"Clasa {cname}: {total} ore/săpt > {total_slots} sloturi totale disponibile"
+                f"Clasa {cname}: {total} ore/săpt > {D}z × {max_pd} ore/zi = {D*max_pd} sloturi maxime"
             )
 
-    # ── 4. Conflict profesor între clase (aceeași oră, doi profesori identici) ─
-    # Detectează dacă un profesor are mai multe lecții care trebuie în același slot
-    from collections import defaultdict
-    for teacher_id, lessons in teacher_lessons.items():
-        tname = teacher_names.get(teacher_id, teacher_id[:8])
-        # Dacă toate lecțiile au același set de sloturi permise și sunt mai multe
-        # decât sloturi disponibile, e garantat conflict
-        all_allowed = set()
-        for l in lessons:
-            slots = l.allowed_slots if l.duration == 1 else [
-                s for s in l.allowed_slots
-                if int(s.split('-')[1]) < P - 1
-                and f"{s.split('-')[0]}-{int(s.split('-')[1])+1}" in l.allowed_slots
-            ]
-            all_allowed.update(slots)
-        if len(lessons) > len(all_allowed):
-            reasons.append(
-                f"{tname}: are {len(lessons)} lecții de plasat dar doar "
-                f"{len(all_allowed)} sloturi unice disponibile — imposibil fără suprapuneri"
-            )
+    # ── 4. Soft constraints prea stricte ────────────────────────────────────
+    # Dacă nu am găsit cauze hard, soft constraints cu weight mare pot fi cauza
+    w = payload.soft_rules.weights if payload.soft_rules else {}
+    soft_issues = []
+    if w.get('sameSubject', 0) > 50:
+        # avoidSameSubjectTwicePerDay limitează la 1 lecție/zi per clasă per materie
+        # Dacă o materie are >D ore/săpt la o clasă → imposibil
+        for class_id, lessons in class_lessons.items():
+            cname = class_names.get(class_id, class_id[:8])
+            subj_counts: dict[str, int] = defaultdict(int)
+            for l in lessons:
+                subj_counts[l.subject_id] += 1
+            for subj_id, count in subj_counts.items():
+                if count > D:
+                    soft_issues.append(
+                        f"Clasa {cname}: {count} ore dintr-o materie > {D} zile — "
+                        f"'avoidSameSubjectTwicePerDay' (weight={w.get('sameSubject')}) "
+                        f"face imposibilă plasarea. Reduce weight-ul sau numărul de ore."
+                    )
+    if w.get('startFirst', 0) > 70 and len(teacher_lessons) >= 3:
+        soft_issues.append(
+            f"'startFromFirstSlot' (weight={w.get('startFirst')}) cu {len(teacher_lessons)} profesori "
+            f"poate crea conflicte — toți vor primul slot. Încearcă să reduci weight-ul sub 50."
+        )
+    for issue in soft_issues:
+        reasons.append(f"⚠ Soft constraint: {issue}")
 
-    # ── 5. Sumar intrări (mereu afișat — util pentru debug) ────────────────
-    from collections import defaultdict
-
-    # Total ore per clasă
-    class_hours: dict[str, int] = defaultdict(int)
-    # Total ore per profesor
-    teacher_hours: dict[str, int] = defaultdict(int)
-    # Detaliu: profesor → {clasă: ore}
-    teacher_class_hours: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-
-    for lesson in payload.lessons:
-        cname = class_names.get(lesson.class_id, lesson.class_id[:8])
-        tname = teacher_names.get(lesson.teacher_id, lesson.teacher_id[:8])
-        class_hours[cname]   += 1
-        teacher_hours[tname] += 1
-        teacher_class_hours[tname][cname] += 1
-
+    # ── 5. Sumar intrări (mereu afișat) ──────────────────────────────────────
     total_lessons = len(payload.lessons)
-
-    # Sumar general
-    # Limita nu e globală — fiecare profesor are propriul set de sloturi
-    # Un profesor poate preda max D×P ore/săpt (minus indisponibilități)
-    # Verificăm dacă vreun profesor e supraîncărcat față de sloturi proprii
-    teacher_slot_issues = []
-    for tname, load in teacher_hours.items():
-        tcfg = next((t for t in payload.teachers if teacher_names.get(t.id) == tname), None)
-        if tcfg:
-            unavail = len(tcfg.preferred_slots)  # nu avem unavailable direct aici
-        avail = total_slots  # simplificat — fără indisponibilități în acest context
-        if load > avail:
-            teacher_slot_issues.append(f"{tname}: {load}h > {avail} sloturi")
-
     reasons.append(
-        f"[SUMAR] {total_lessons} lecții pentru {len(class_hours)} clase, "
-        f"{len(teacher_hours)} profesori, {D}z × {P}sl = {total_slots} sloturi/profesor"
-        + (f" ⚠ profesori supraîncărcați: {', '.join(teacher_slot_issues)}" if teacher_slot_issues else " ✓")
+        f"[SUMAR] {total_lessons} lecții · {len(class_hours)} clase · "
+        f"{len(teacher_hours)} profesori · {D}z × {P}sl = {total_slots} sloturi/profesor"
     )
 
-    # Per profesor
     for tname, total in sorted(teacher_hours.items(), key=lambda x: -x[1]):
-        tcfg = next((t for t in payload.teachers if teacher_names.get(t.id) == tname), None)
-        max_w = tcfg.max_lessons_per_week if tcfg and tcfg.max_lessons_per_week else '∞'
-        max_d = tcfg.max_lessons_per_day  if tcfg and tcfg.max_lessons_per_day  else '∞'
-        clase_str = ', '.join(f"{c}:{h}h" for c, h in sorted(teacher_class_hours[tname].items()))
-        status = f" ⚠ depășit ({total}>{max_w})" if isinstance(max_w, int) and total > max_w else ''
+        tcfg  = next((t for t in payload.teachers if teacher_names.get(t.id) == tname), None)
+        max_w = tcfg.max_lessons_per_week if tcfg and tcfg.max_lessons_per_week else "∞"
+        max_d = tcfg.max_lessons_per_day  if tcfg and tcfg.max_lessons_per_day  else "∞"
+        avg   = total / D
+        clase_str = ", ".join(f"{c}:{h}h" for c, h in sorted(teacher_class_hours[tname].items()))
+        warn  = " ⚠" if (isinstance(max_w, int) and total > max_w) or avg > (max_d if isinstance(max_d, int) else 999) else ""
         reasons.append(
-            f"[PROF] {tname}: {total}h/săpt (max {max_w}/săpt, {max_d}/zi){status} → {clase_str}"
+            f"[PROF] {tname}: {total}h/săpt, {avg:.1f}h/zi medie "
+            f"(max {max_w}/săpt, {max_d}/zi){warn} → {clase_str}"
         )
 
-    # Per clasă
     for cname, total in sorted(class_hours.items()):
-        ccfg = next((c for c in payload.classes if class_names.get(c.id) == cname), None)
+        ccfg   = next((c for c in payload.classes if class_names.get(c.id) == cname), None)
         max_pd = ccfg.max_lessons_per_day if ccfg else P
-        max_total = D * max_pd
-        status = f" ⚠ depășit ({total}>{max_total})" if total > max_total else ''
+        warn   = " ⚠" if total > D * max_pd else ""
         reasons.append(
-            f"[CLASĂ] {cname}: {total}h/săpt (max {max_pd}/zi × {D}z = {max_total}){status}"
+            f"[CLASĂ] {cname}: {total}h/săpt (max {max_pd}/zi × {D}z = {D*max_pd}){warn}"
         )
 
     return reasons
