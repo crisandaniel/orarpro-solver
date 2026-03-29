@@ -226,6 +226,13 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     class_idx   = {c.id: i for i, c in enumerate(classes)}
     room_idx    = {r.id: i for i, r in enumerate(rooms)}
 
+    logger.info(f"=== School solver start ===")
+    logger.info(f"  Teachers: {[t.name for t in teachers]}")
+    logger.info(f"  Subjects: {[s.name for s in subjects]}")
+    logger.info(f"  Classes:  {[c.name for c in classes]}")
+    logger.info(f"  Rooms:    {[r.name for r in rooms]}")
+    logger.info(f"  Config:   days={D} periods={P} students_move={cfg.students_move_rooms} start_first={cfg.start_from_first_period}")
+
     # Per-class assignment data
     asgn_periods:     dict[tuple[int,int], int]  = {}
     asgn_consecutive: dict[tuple[int,int], bool] = {}
@@ -233,6 +240,7 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
 
     for a in payload.assignments:
         if a.subject_id not in subject_idx or a.class_id not in class_idx:
+            logger.warning(f"  Skipping assignment: subject={a.subject_id} class={a.class_id} (not found in index)")
             continue
         sui = subject_idx[a.subject_id]
         ci  = class_idx[a.class_id]
@@ -240,6 +248,10 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
         asgn_consecutive[(ci, sui)] = a.requires_consecutive
         if a.teacher_id in teacher_idx:
             asgn_teacher[(ci, sui)] = teacher_idx[a.teacher_id]
+        tname = next((t.name for t in teachers if t.id == a.teacher_id), a.teacher_id)
+        cname = classes[ci].name
+        sname = subjects[sui].name
+        logger.info(f"  Assignment: {tname} → {sname} → {cname} × {a.periods_per_week}h/w consec={a.requires_consecutive}")
 
     # Teacher → subjects
     teacher_can_teach: dict[int, set[int]] = {
@@ -289,6 +301,10 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                             x[(ti, sui, ci, ri, d, p)] = model.new_bool_var(
                                 f"x_t{ti}_s{sui}_c{ci}_r{ri}_d{d}_p{p}"
                             )
+
+    logger.info(f"  Variables created: {len(x)}")
+    if len(x) == 0:
+        logger.error("  ZERO variables! Check teacher subject_ids match assignment subject IDs")
 
     def slots(*, ti=None, sui=None, ci=None, ri=None, d=None, p=None):
         return [v for (t2,s2,c2,r2,d2,p2), v in x.items()
@@ -456,6 +472,7 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     status = solver.solve(model)
     status_name = solver.status_name(status)
     logger.info(f"School solver: {status_name} in {solver.wall_time:.2f}s")
+    logger.info(f"  Objective value: {solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else 'N/A'}")
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         total = sum(asgn_periods.get((class_idx.get(a.class_id,-1),
@@ -466,7 +483,18 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
             teacher_can_teach, asgn_teacher, homeroom, room_for_subject,
             D, P, cfg
         )
-        logger.warning(f"INFEASIBLE reasons: {reasons}")
+        logger.warning(f"=== INFEASIBLE ({status_name}) in {solver.wall_time:.2f}s ===")
+        logger.warning(f"  Variables: {len(x)}, total lessons needed: {total}")
+        logger.warning(f"  Config: start_first={cfg.start_from_first_period} no_windows={True} max_day={cfg.max_periods_per_day}")
+        for i, r in enumerate(reasons):
+            logger.warning(f"  Reason {i+1}: {r}")
+        # Log per-teacher load
+        for t in payload.teachers:
+            t_needed = sum(
+                asgn_periods.get((class_idx.get(a.class_id,-1), subject_idx.get(a.subject_id,-1)), 0)
+                for a in payload.assignments if a.teacher_id == t.id
+            )
+            logger.warning(f"  Teacher '{t.name}': needs {t_needed}h/w, limit={t.max_periods_per_week}h/w ({t.max_periods_per_day}h/day)")
         violations = [
             SchoolViolation(type="infeasible", entity_id="", entity_name="", message=r)
             for r in reasons
@@ -485,6 +513,12 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                class_id=classes[ci].id, room_id=rooms[ri].id, day=d, period=p)
         for (ti, sui, ci, ri, d, p), v in x.items() if solver.value(v) == 1
     ]
+
+    logger.info(f"  Lessons generated: {len(timetable)}")
+    # Summary per teacher
+    for ti, t in enumerate(teachers):
+        t_lessons = [l for l in timetable if l.teacher_id == t.id]
+        logger.info(f"  {t.name}: {len(t_lessons)} lessons → {sorted(set((l.day, l.period) for l in t_lessons))}")
 
     # Post-solve validation — detect teacher conflicts
     teacher_slots: dict[tuple, list] = {}
@@ -515,10 +549,12 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                 violations.append(SchoolViolation(type="underscheduled",
                     entity_id=cls.id, entity_name=cls.name,
                     message=f"'{subjects[sui].name}' for '{cls.name}': {got}/{n}"))
+                logger.warning(f"  UNDERSCHEDULED: {subjects[sui].name} for {cls.name}: {got}/{n}")
 
     total = sum(asgn_periods.get((ci, sui), subjects[sui].periods_per_week)
                 for ci in range(len(classes)) for sui in class_subjects[ci])
 
+    logger.info(f"=== School solver done: {len(timetable)}/{total} lessons, {len(violations)} violations ===")
     return SchoolResponse(timetable=timetable, violations=violations,
         stats=SchoolStats(total_lessons=total, scheduled_lessons=len(timetable),
             teacher_windows=total_windows, solver_status=status_name,
