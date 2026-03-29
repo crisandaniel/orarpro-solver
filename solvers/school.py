@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 class ClassSubject(BaseModel):
     class_id: str
     subject_id: str
+    teacher_id: str                   # required — used for conflict constraints
     periods_per_week: int
     requires_consecutive: bool = False
     preferred_morning: bool = False   # soft: schedule early
@@ -91,9 +92,10 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     logger.info(f"  Config: start_first={cfg.start_from_first_period} avoid_win={cfg.avoid_windows}")
 
     for cs in payload.class_subjects:
-        logger.info(f"  CS: class={cs.class_id[:8]} subj={cs.subject_id[:8]} n={cs.periods_per_week} consec={cs.requires_consecutive}")
+        logger.info(f"  CS: class={cs.class_id[:8]} subj={cs.subject_id[:8]} teacher={cs.teacher_id[:8]} n={cs.periods_per_week} consec={cs.requires_consecutive}")
         debug_log.append({"type": "assignment",
                           "class_id": cs.class_id, "subject_id": cs.subject_id,
+                          "teacher_id": cs.teacher_id,
                           "periods_per_week": cs.periods_per_week,
                           "consecutive": cs.requires_consecutive})
 
@@ -131,7 +133,27 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                 s = slots(ci=ci, d=d, p=p)
                 if s: model.add(sum(s) <= 1)
 
-    # ── HARD 3: Max same subject per day ──────────────────────────────────────
+    # ── HARD 3: Teacher once per slot ────────────────────────────────────────
+    # Group assignments by teacher — teacher cannot be in two classes at same time
+    from collections import defaultdict
+    teacher_cs: dict[str, list[ClassSubject]] = defaultdict(list)
+    for cs in payload.class_subjects:
+        teacher_cs[cs.teacher_id].append(cs)
+
+    for teacher_id, cs_list in teacher_cs.items():
+        if len(cs_list) <= 1:
+            continue  # single assignment — no conflict possible
+        for d in range(D):
+            for p in range(P):
+                teacher_slots = []
+                for cs in cs_list:
+                    s = slots(ci=cs.class_id, si=cs.subject_id, d=d, p=p)
+                    teacher_slots.extend(s)
+                if len(teacher_slots) > 1:
+                    model.add(sum(teacher_slots) <= 1)
+                    logger.debug(f"  Teacher {teacher_id[:8]} conflict constraint at d={d} p={p}: {len(teacher_slots)} vars")
+
+    # ── HARD 4: Max same subject per day ──────────────────────────────────────
     for cs in payload.class_subjects:
         max_per_day = 2 if cs.requires_consecutive else 1
         for d in range(D):
