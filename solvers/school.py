@@ -276,66 +276,14 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
             if day_vars:
                 model.add(sum(day_vars) <= max_pd)
 
-    # ── SOFT objective ────────────────────────────────────────────────────────
-    # Toate soft constraints sunt DOAR penalizări în objective.
-    # Implementare simplă fără only_enforce_if — evită interacțiuni cu hard constraints.
+    # ── SOFT objective — temporarily disabled for debugging ─────────────────
+    # Toate soft constraints dezactivate pentru a confirma feasibility
     objective = []
-    w = cfg.weights
+    logger.info("  Soft constraints: DISABLED for debug")
 
-    # 1. Evită ultima oră pentru clase mici
-    if cfg.avoidLastHourForStages and w.get('lastHour', 0) > 0:
-        weight = w['lastHour']
-        young_classes = {c.id for c in payload.classes if c.stage in cfg.avoidLastHourForStages}
-        for lesson in payload.lessons:
-            if lesson.class_id in young_classes:
-                for d in range(D):
-                    last = f"{d}-{P-1}"
-                    if last in x[lesson.id]:
-                        objective.append(x[lesson.id][last] * weight)
-
-    # 2. Evită aceeași materie de 2 ori pe zi per clasă
-    if cfg.avoidSameSubjectTwicePerDay and w.get('sameSubject', 0) > 0:
-        weight = w['sameSubject']
-        subj_class_lessons: dict = defaultdict(list)
-        for lesson in payload.lessons:
-            subj_class_lessons[(lesson.subject_id, lesson.class_id)].append(lesson)
-        for (subj_id, class_id), sc_lessons in subj_class_lessons.items():
-            if len(sc_lessons) <= 1:
-                continue
-            for d in range(D):
-                day_vars = [x[l.id][s] for l in sc_lessons
-                            for s in x[l.id] if parse_slot(s)[0] == d]
-                if len(day_vars) <= 1:
-                    continue
-                count_v  = model.new_int_var(0, len(day_vars), f"sc_{subj_id[:6]}_{class_id[:6]}_d{d}")
-                model.add(count_v == sum(day_vars))
-                excess_v = model.new_int_var(0, len(day_vars), f"ex_{subj_id[:6]}_{class_id[:6]}_d{d}")
-                zero_c   = model.new_constant(0)
-                model.add_max_equality(excess_v, [count_v - 1, zero_c])
-                objective.append(excess_v * weight)
-
-    # 3. Preferința profesorului pentru anumite sloturi
-    for tcfg in payload.teachers:
-        if not tcfg.preferred_slots:
-            continue
-        preferred_set = set(tcfg.preferred_slots)
-        for lesson in teacher_lessons.get(tcfg.id, []):
-            for slot, var in x[lesson.id].items():
-                if slot not in preferred_set:
-                    objective.append(var * 5)
-
-    # 4. Penalizare sloturi târzii (înlocuiește teacher gaps și startFromFirstSlot)
-    # Simplu și fără risc de infeasibility: ore mai târzii în zi = penalizare mai mare
-    slot_weight = max(w.get('teacherGaps', 0), w.get('startFirst', 0))
-    if slot_weight > 0:
-        for lesson in payload.lessons:
-            for slot, var in x[lesson.id].items():
-                p = parse_slot(slot)[1]
-                if p > 0:
-                    objective.append(var * p * slot_weight // 20)
-
-    if objective:
-        model.minimize(sum(objective))
+    # ── Model stats ──────────────────────────────────────────────────────────
+    proto = model.proto
+    logger.info(f"  Model: {len(proto.variables)} vars, {len(proto.constraints)} constraints")
 
     # ── Pre-solve sanity check ───────────────────────────────────────────────
     # Log exact constraints per teacher to understand infeasibility
