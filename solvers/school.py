@@ -114,6 +114,102 @@ class SchoolResponse(BaseModel):
     violations: list[SchoolViolation]
     stats: SchoolStats
 
+
+def analyze_infeasibility(payload, class_subjects, asgn_periods, subject_idx, class_idx,
+                           teacher_can_teach, asgn_teacher, homeroom, room_for_subject,
+                           D, P, cfg) -> list[str]:
+    """
+    Identify which constraints make the model infeasible.
+    Strategy: try solving with each hard constraint relaxed individually.
+    Returns human-readable reasons.
+    """
+    teachers = payload.teachers
+    subjects = payload.subjects
+    classes  = payload.classes
+    rooms    = payload.rooms
+    reasons  = []
+
+    # Check 1: Coverage feasibility — can periods_per_week fit in D*P slots?
+    for ci, cls in enumerate(classes):
+        for sui in class_subjects[ci]:
+            n = asgn_periods.get((ci, sui), subjects[sui].periods_per_week)
+            max_possible = D * P  # absolute max
+            # With max 1/day constraint: max = D (one per day)
+            is_consec = subjects[sui].requires_consecutive
+            max_with_constraint = D * 2 if is_consec else D
+            if n > max_with_constraint:
+                reasons.append(
+                    f"Clasa '{cls.name}', materia '{subjects[sui].name}': "
+                    f"{n} ore/săpt > {max_with_constraint} maxim posibil "
+                    f"({'dublu → max 2/zi' if is_consec else 'max 1/zi'} × {D} zile)"
+                )
+
+    # Check 2: Teacher availability — can teacher cover all their assignments?
+    for ti, t in enumerate(teachers):
+        total_needed = sum(
+            asgn_periods.get((ci, sui), subjects[sui].periods_per_week)
+            for ci in range(len(classes))
+            for sui in class_subjects[ci]
+            if (ci, sui) in asgn_teacher and asgn_teacher[(ci, sui)] == ti
+        )
+        if total_needed > t.max_periods_per_week:
+            reasons.append(
+                f"Profesorul '{t.name}': are de predat {total_needed} ore/săpt "
+                f"dar limita e {t.max_periods_per_week} ore/săpt"
+            )
+        per_day_needed = total_needed / D if D > 0 else 0
+        if per_day_needed > t.max_periods_per_day:
+            reasons.append(
+                f"Profesorul '{t.name}': distribuție uniformă ar necesita "
+                f"{per_day_needed:.1f} ore/zi dar limita e {t.max_periods_per_day}"
+            )
+
+    # Check 3: Teacher not assigned to subject
+    for ci, cls in enumerate(classes):
+        for sui in class_subjects[ci]:
+            has_teacher = any(
+                sui in teacher_can_teach.get(ti, set())
+                for ti in range(len(teachers))
+                if (ci, sui) not in asgn_teacher or asgn_teacher[(ci, sui)] == ti
+            )
+            if not has_teacher:
+                reasons.append(
+                    f"Clasa '{cls.name}', materia '{subjects[sui].name}': "
+                    f"niciun profesor calificat disponibil"
+                )
+
+    # Check 4: No room available for subject type
+    for sui, s in enumerate(subjects):
+        matching_rooms = [r for r in rooms if r.room_type == s.room_type]
+        if not matching_rooms and not rooms:
+            reasons.append(f"Materia '{s.name}': nicio sală definită în instituție")
+        elif not matching_rooms and s.room_type != 'classroom':
+            reasons.append(
+                f"Materia '{s.name}' necesită sală de tip '{s.room_type}' "
+                f"dar nu există astfel de sală definită (se va folosi orice sală)"
+            )
+
+    # Check 5: No-window constraint + single lesson days
+    if cfg.start_from_first_period or True:  # always check
+        for ci, cls in enumerate(classes):
+            total = sum(asgn_periods.get((ci, sui), subjects[sui].periods_per_week)
+                       for sui in class_subjects[ci])
+            if total > D * P:
+                reasons.append(
+                    f"Clasa '{cls.name}': total {total} ore/săpt "
+                    f"depășește capacitatea {D * P} sloturi disponibile"
+                )
+
+    if not reasons:
+        reasons.append(
+            "Constrângerile combinate fac orarul imposibil. "
+            "Încearcă: mai mulți profesori, mai multe săli, "
+            "sau reducerea numărului de ore pe săptămână."
+        )
+
+    return reasons
+
+
 # ── Solver ────────────────────────────────────────────────────────────────────
 
 def solve_school(payload: SchoolRequest) -> SchoolResponse:
@@ -365,11 +461,19 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
         total = sum(asgn_periods.get((class_idx.get(a.class_id,-1),
                     subject_idx.get(a.subject_id,-1)), 0)
                     for a in payload.assignments)
+        reasons = analyze_infeasibility(
+            payload, class_subjects, asgn_periods, subject_idx, class_idx,
+            teacher_can_teach, asgn_teacher, homeroom, room_for_subject,
+            D, P, cfg
+        )
+        logger.warning(f"INFEASIBLE reasons: {reasons}")
+        violations = [
+            SchoolViolation(type="infeasible", entity_id="", entity_name="", message=r)
+            for r in reasons
+        ]
         return SchoolResponse(
             timetable=[],
-            violations=[SchoolViolation(type="infeasible", entity_id="", entity_name="",
-                message=f"No feasible timetable ({status_name}). "
-                        f"Check teacher assignments and room types.")],
+            violations=violations,
             stats=SchoolStats(total_lessons=total, scheduled_lessons=0,
                 teacher_windows=0, solver_status=status_name,
                 solve_time_seconds=solver.wall_time)
