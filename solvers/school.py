@@ -203,15 +203,16 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     for teacher_id, lessons in teacher_lessons.items():
         for d in range(D):
             for p in range(P):
-                slot = f"{d}-{p}"
                 vars_at_slot = []
                 for l in lessons:
+                    slot = f"{d}-{p}"
+                    # Lesson starts at this slot
                     if slot in x[l.id]:
                         vars_at_slot.append(x[l.id][slot])
-                    # Duration=2 occupies slot AND slot+1
-                    if l.duration == 2:
-                        prev = f"{d}-{p-1}" if p > 0 else None
-                        if prev and prev in x[l.id]:
+                    # Duration=2: lesson starting at p-1 also occupies slot p
+                    if l.duration == 2 and p > 0:
+                        prev = f"{d}-{p-1}"
+                        if prev in x[l.id]:
                             vars_at_slot.append(x[l.id][prev])
                 if len(vars_at_slot) > 1:
                     model.add(sum(vars_at_slot) <= 1)
@@ -224,14 +225,14 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     for class_id, lessons in class_lessons.items():
         for d in range(D):
             for p in range(P):
-                slot = f"{d}-{p}"
                 vars_at_slot = []
                 for l in lessons:
+                    slot = f"{d}-{p}"
                     if slot in x[l.id]:
                         vars_at_slot.append(x[l.id][slot])
-                    if l.duration == 2:
-                        prev = f"{d}-{p-1}" if p > 0 else None
-                        if prev and prev in x[l.id]:
+                    if l.duration == 2 and p > 0:
+                        prev = f"{d}-{p-1}"
+                        if prev in x[l.id]:
                             vars_at_slot.append(x[l.id][prev])
                 if len(vars_at_slot) > 1:
                     model.add(sum(vars_at_slot) <= 1)
