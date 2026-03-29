@@ -463,39 +463,110 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
 
 
 def _analyze_infeasibility(payload, teacher_lessons, class_lessons, D, P):
-    """Fast pre-solve analysis to give human-readable infeasibility reasons."""
+    """
+    Analiză detaliată a motivelor de infeasibility.
+    Folosește nume în loc de UUID-uri, verifică mai multe scenarii.
+    """
     reasons = []
+    total_slots = D * P
 
+    # Index nume
+    teacher_names = {t.id: t.name for t in payload.teachers}
+    class_names   = {c.id: c.name for c in payload.classes}
+
+    # ── 1. Lecții fără sloturi valide ────────────────────────────────────────
     for lesson in payload.lessons:
         if not x_has_slots(lesson, D, P):
-            reasons.append(f"Lecție fără sloturi valide: class={lesson.class_id[:8]} teacher={lesson.teacher_id[:8]}")
+            tname = teacher_names.get(lesson.teacher_id, lesson.teacher_id[:8])
+            cname = class_names.get(lesson.class_id, lesson.class_id[:8])
+            unavail = len(payload.teachers[0].unavailable_slots) if payload.teachers else 0
+            reasons.append(
+                f"{tname} → {cname}: niciun slot valid disponibil"
+                + (f" (profesor are {unavail} sloturi indisponibile)" if unavail else "")
+            )
 
+    # ── 2. Profesor supraîncărcat (ore/săpt) ─────────────────────────────────
     for teacher_id, lessons in teacher_lessons.items():
+        tname = teacher_names.get(teacher_id, teacher_id[:8])
         total = len(lessons)
-        tcfg = next((t for t in payload.teachers if t.id == teacher_id), None)
+        tcfg  = next((t for t in payload.teachers if t.id == teacher_id), None)
+
         if tcfg and tcfg.max_lessons_per_week and total > tcfg.max_lessons_per_week:
             reasons.append(
-                f"Profesor {teacher_id[:8]}: {total} lecții > max {tcfg.max_lessons_per_week}/săpt"
+                f"{tname}: asignat {total} ore/săpt dar limita e {tcfg.max_lessons_per_week} ore/săpt"
             )
-        # Check if enough valid slots
-        unique_slots_per_lesson = [len(x_get_slots(l, D, P)) for l in lessons]
-        if sum(1 for s in unique_slots_per_lesson if s == 0) > 0:
-            reasons.append(f"Profesor {teacher_id[:8]}: unele lecții nu au sloturi valide")
 
+        # Ore/zi imposibile
+        if tcfg and tcfg.max_lessons_per_day:
+            min_days_needed = -(-total // tcfg.max_lessons_per_day)  # ceil division
+            if min_days_needed > D:
+                reasons.append(
+                    f"{tname}: {total} ore cu max {tcfg.max_lessons_per_day}/zi necesită "
+                    f"cel puțin {min_days_needed} zile, dar săptămâna are doar {D}"
+                )
+
+        # Sloturi disponibile insuficiente (după excluderea indisponibilităților)
+        if tcfg:
+            available_slots = set()
+            for l in lessons:
+                available_slots.update(l.allowed_slots)
+            # Sloturi unice disponibile pentru profesor
+            if len(available_slots) < total:
+                reasons.append(
+                    f"{tname}: are nevoie de {total} sloturi distincte dar are doar "
+                    f"{len(available_slots)} sloturi disponibile (după indisponibilități)"
+                )
+
+    # ── 3. Clasă supraîncărcată ───────────────────────────────────────────────
     for class_id, lessons in class_lessons.items():
+        cname = class_names.get(class_id, class_id[:8])
         total = len(lessons)
-        ccfg = next((c for c in payload.classes if c.id == class_id), None)
-        max_pd = ccfg.max_lessons_per_day if ccfg else 8
+        ccfg  = next((c for c in payload.classes if c.id == class_id), None)
+        max_pd = ccfg.max_lessons_per_day if ccfg else P
+
         if total > D * max_pd:
             reasons.append(
-                f"Clasă {class_id[:8]}: {total} lecții > {D}z × {max_pd} = {D*max_pd} sloturi"
+                f"Clasa {cname}: {total} ore/săpt depășește capacitatea "
+                f"{D} zile × {max_pd} ore/zi = {D * max_pd} sloturi maxime"
+            )
+        elif total > total_slots:
+            reasons.append(
+                f"Clasa {cname}: {total} ore/săpt > {total_slots} sloturi totale disponibile"
             )
 
+    # ── 4. Conflict profesor între clase (aceeași oră, doi profesori identici) ─
+    # Detectează dacă un profesor are mai multe lecții care trebuie în același slot
+    from collections import defaultdict
+    for teacher_id, lessons in teacher_lessons.items():
+        tname = teacher_names.get(teacher_id, teacher_id[:8])
+        # Dacă toate lecțiile au același set de sloturi permise și sunt mai multe
+        # decât sloturi disponibile, e garantat conflict
+        all_allowed = set()
+        for l in lessons:
+            slots = l.allowed_slots if l.duration == 1 else [
+                s for s in l.allowed_slots
+                if int(s.split('-')[1]) < P - 1
+                and f"{s.split('-')[0]}-{int(s.split('-')[1])+1}" in l.allowed_slots
+            ]
+            all_allowed.update(slots)
+        if len(lessons) > len(all_allowed):
+            reasons.append(
+                f"{tname}: are {len(lessons)} lecții de plasat dar doar "
+                f"{len(all_allowed)} sloturi unice disponibile — imposibil fără suprapuneri"
+            )
+
+    # ── Fallback — dacă nu am găsit nimic specific ──────────────────────────
     if not reasons:
+        # Cel puțin afișăm statistici utile
+        total_lessons = len(payload.lessons)
+        total_avail   = sum(len(l.allowed_slots) for l in payload.lessons)
         reasons.append(
-            "Constrângerile combinate sunt incompatibile. "
-            "Verifică indisponibilitățile profesorilor, limitele de ore/zi și numărul total de ore."
+            f"Constrângerile combinate sunt incompatibile ({total_lessons} lecții, "
+            f"{total_avail} sloturi disponibile total, {D}z × {P}sl = {total_slots} sloturi). "
+            f"Verifică: indisponibilitățile profesorilor, max ore/zi per clasă și profesor, "
+            f"și numărul total de ore asignate."
         )
+
     return reasons
 
 
