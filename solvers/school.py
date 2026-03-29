@@ -277,98 +277,62 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                 model.add(sum(day_vars) <= max_pd)
 
     # ── SOFT objective ────────────────────────────────────────────────────────
+    # Toate soft constraints sunt DOAR penalizări în objective.
+    # Implementare simplă fără only_enforce_if — evită interacțiuni cu hard constraints.
     objective = []
     w = cfg.weights
 
-    # Teacher gaps (windows between lessons on same day)
-    if cfg.avoidGapsForTeachers and w.get('teacherGaps', 0) > 0:
-        weight = w['teacherGaps']
-        for teacher_id, lessons in teacher_lessons.items():
-            for d in range(D):
-                worked: list[tuple[int, cp_model.IntVar]] = []
-                for p in range(P):
-                    slot = f"{d}-{p}"
-                    slot_vars = [x[l.id][slot] for l in lessons if slot in x[l.id]]
-                    if slot_vars:
-                        w_var = model.new_bool_var(f"tw_{teacher_id[:6]}_d{d}_p{p}")
-                        model.add(sum(slot_vars) >= w_var)
-                        model.add(sum(slot_vars) <= w_var)
-                        worked.append((p, w_var))
-                for i, (p1, w1) in enumerate(worked):
-                    for p2, w2 in worked[i+1:]:
-                        gap = p2 - p1 - 1
-                        if gap <= 0:
-                            continue
-                        both = model.new_bool_var(f"gap_{teacher_id[:6]}_d{d}_{p1}_{p2}")
-                        model.add_bool_and([w1, w2]).only_enforce_if(both)
-                        model.add_bool_or([w1.negated(), w2.negated()]).only_enforce_if(both.negated())
-                        objective.append(both * gap * weight)
-
-    # Avoid last slot for young classes
+    # 1. Evită ultima oră pentru clase mici
     if cfg.avoidLastHourForStages and w.get('lastHour', 0) > 0:
         weight = w['lastHour']
-        last_slot_per_day = {d: f"{d}-{P-1}" for d in range(D)}
         young_classes = {c.id for c in payload.classes if c.stage in cfg.avoidLastHourForStages}
         for lesson in payload.lessons:
             if lesson.class_id in young_classes:
                 for d in range(D):
-                    last = last_slot_per_day[d]
+                    last = f"{d}-{P-1}"
                     if last in x[lesson.id]:
                         objective.append(x[lesson.id][last] * weight)
 
-    # Avoid same subject twice per day per class
+    # 2. Evită aceeași materie de 2 ori pe zi per clasă
     if cfg.avoidSameSubjectTwicePerDay and w.get('sameSubject', 0) > 0:
         weight = w['sameSubject']
-        subj_class_lessons: dict[tuple, list[Lesson]] = defaultdict(list)
+        subj_class_lessons: dict = defaultdict(list)
         for lesson in payload.lessons:
             subj_class_lessons[(lesson.subject_id, lesson.class_id)].append(lesson)
-        for (subj_id, class_id), lessons in subj_class_lessons.items():
-            if len(lessons) <= 1:
+        for (subj_id, class_id), sc_lessons in subj_class_lessons.items():
+            if len(sc_lessons) <= 1:
                 continue
             for d in range(D):
-                day_vars = [x[l.id][s] for l in lessons for s in x[l.id] if parse_slot(s)[0] == d]
-                if len(day_vars) > 1:
-                    # Penalize having more than 1 lesson of same subject/class on same day
-                    count_var = model.new_int_var(0, len(day_vars), f"sc_{subj_id[:6]}_{class_id[:6]}_d{d}")
-                    model.add(count_var == sum(day_vars))
-                    excess = model.new_int_var(0, len(day_vars), f"ex_{subj_id[:6]}_{class_id[:6]}_d{d}")
-                    model.add(excess == count_var - 1)
-                    objective.append(excess * weight)
-
-    # Start from first slot (no gaps at start of day for class)
-    if cfg.startFromFirstSlot and w.get('startFirst', 0) > 0:
-        weight = w['startFirst']
-        for class_id, lessons in class_lessons.items():
-            for d in range(D):
-                at_zero = [x[l.id][f"{d}-0"] for l in lessons if f"{d}-0" in x[l.id]]
-                at_rest = [x[l.id][s] for l in lessons for s in x[l.id]
-                           if parse_slot(s) == (d, 0) or parse_slot(s)[0] != d]
-                at_later = [x[l.id][s] for l in lessons for s in x[l.id]
-                            if parse_slot(s)[0] == d and parse_slot(s)[1] > 0]
-                if not at_zero or not at_later:
+                day_vars = [x[l.id][s] for l in sc_lessons
+                            for s in x[l.id] if parse_slot(s)[0] == d]
+                if len(day_vars) <= 1:
                     continue
-                has_zero  = model.new_bool_var(f"sz_{class_id[:6]}_d{d}")
-                has_later = model.new_bool_var(f"sl_{class_id[:6]}_d{d}")
-                model.add(sum(at_zero)  >= has_zero)
-                model.add(sum(at_zero)  <= len(at_zero) * has_zero)
-                model.add(sum(at_later) >= has_later)
-                model.add(sum(at_later) <= len(at_later) * has_later)
-                gap = model.new_bool_var(f"sg_{class_id[:6]}_d{d}")
-                model.add_bool_and([has_later, has_zero.negated()]).only_enforce_if(gap)
-                model.add_bool_or([has_later.negated(), has_zero]).only_enforce_if(gap.negated())
-                objective.append(gap * weight)
+                count_v  = model.new_int_var(0, len(day_vars), f"sc_{subj_id[:6]}_{class_id[:6]}_d{d}")
+                model.add(count_v == sum(day_vars))
+                excess_v = model.new_int_var(0, len(day_vars), f"ex_{subj_id[:6]}_{class_id[:6]}_d{d}")
+                zero_c   = model.new_constant(0)
+                model.add_max_equality(excess_v, [count_v - 1, zero_c])
+                objective.append(excess_v * weight)
 
-    # Teacher preferred slots (soft — prefer to schedule in preferred slots)
+    # 3. Preferința profesorului pentru anumite sloturi
     for tcfg in payload.teachers:
         if not tcfg.preferred_slots:
             continue
         preferred_set = set(tcfg.preferred_slots)
-        lessons = teacher_lessons.get(tcfg.id, [])
-        for lesson in lessons:
+        for lesson in teacher_lessons.get(tcfg.id, []):
             for slot, var in x[lesson.id].items():
                 if slot not in preferred_set:
-                    # Small penalty for not being in preferred slot
                     objective.append(var * 5)
+
+    # 4. Penalizare sloturi târzii (înlocuiește teacher gaps și startFromFirstSlot)
+    # Simplu și fără risc de infeasibility: ore mai târzii în zi = penalizare mai mare
+    slot_weight = max(w.get('teacherGaps', 0), w.get('startFirst', 0))
+    if slot_weight > 0:
+        for lesson in payload.lessons:
+            for slot, var in x[lesson.id].items():
+                p = parse_slot(slot)[1]
+                if p > 0:
+                    objective.append(var * p * slot_weight // 20)
 
     if objective:
         model.minimize(sum(objective))
