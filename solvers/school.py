@@ -527,10 +527,23 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
         teacher_slots.setdefault(slot, []).append(lesson.class_id)
     conflicts = {k: v for k, v in teacher_slots.items() if len(v) > 1}
     if conflicts:
-        logger.error(f"TEACHER CONFLICT in solution! {len(conflicts)} slots with multiple classes:")
-        for (tid, d, p), classes_list in list(conflicts.items())[:3]:
+        logger.error(f"!!! TEACHER CONFLICT in solution! {len(conflicts)} slots with multiple classes:")
+        for (tid, d, p), classes_list in list(conflicts.items())[:10]:
             tname = next((t.name for t in teachers if t.id == tid), tid)
-            logger.error(f"  {tname} day={d} period={p}: {classes_list}")
+            snames = [next((s.name for s in subjects if s.id == l.subject_id), '?')
+                      for l in timetable if l.teacher_id == tid and l.day == d and l.period == p]
+            logger.error(f"  {tname} day={d} period={p}: classes={classes_list} subjects={snames}")
+        # Debug: check if variables were created correctly
+        logger.error(f"  Checking variable creation for conflicting teachers...")
+        for (tid, d, p), classes_list in list(conflicts.items())[:2]:
+            ti = teacher_idx.get(tid)
+            if ti is None: continue
+            vars_at_slot = [(t2,s2,c2,r2) for (t2,s2,c2,r2,d2,p2) in x if t2==ti and d2==d and p2==p]
+            logger.error(f"  Variables at slot ti={ti} d={d} p={p}: {vars_at_slot}")
+            constraint_vars = slots(ti=ti, d=d, p=p)
+            logger.error(f"  Constraint had {len(constraint_vars)} vars, sum <= 1 enforced: {len(constraint_vars) > 0}")
+    else:
+        logger.info(f"  No teacher conflicts detected ✓")
 
     total_windows = 0
     for ti in range(len(teachers)):
