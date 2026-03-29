@@ -144,6 +144,12 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     logger.info(f"=== School solver v4 ===")
     logger.info(f"  {len(payload.lessons)} lessons, {D}d × {P}p = {D*P} slots")
     logger.info(f"  teachers: {len(payload.teachers)}, classes: {len(payload.classes)}")
+    # Log class configs
+    for c in payload.classes:
+        logger.info(f"  CLASS {c.name}: max_per_day={c.max_lessons_per_day} stage={c.stage}")
+    # Log teacher configs
+    for t in payload.teachers:
+        logger.info(f"  TEACHER {t.name}: max_pd={t.max_lessons_per_day} max_pw={t.max_lessons_per_week}")
 
     # Index configs
     teacher_cfg = {t.id: t for t in payload.teachers}
