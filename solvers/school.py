@@ -577,10 +577,22 @@ def _analyze_infeasibility(payload, teacher_lessons, class_lessons, D, P):
     total_lessons = len(payload.lessons)
 
     # Sumar general
+    # Limita nu e globală — fiecare profesor are propriul set de sloturi
+    # Un profesor poate preda max D×P ore/săpt (minus indisponibilități)
+    # Verificăm dacă vreun profesor e supraîncărcat față de sloturi proprii
+    teacher_slot_issues = []
+    for tname, load in teacher_hours.items():
+        tcfg = next((t for t in payload.teachers if teacher_names.get(t.id) == tname), None)
+        if tcfg:
+            unavail = len(tcfg.preferred_slots)  # nu avem unavailable direct aici
+        avail = total_slots  # simplificat — fără indisponibilități în acest context
+        if load > avail:
+            teacher_slot_issues.append(f"{tname}: {load}h > {avail} sloturi")
+
     reasons.append(
-        f"[SUMAR] {total_lessons} lecții totale pentru {len(class_hours)} clase "
-        f"în {D} zile × {P} sloturi = {total_slots} sloturi disponibile"
-        + (f" ⚠ IMPOSIBIL: {total_lessons} > {total_slots}" if total_lessons > total_slots else " ✓ nr. sloturi ok")
+        f"[SUMAR] {total_lessons} lecții pentru {len(class_hours)} clase, "
+        f"{len(teacher_hours)} profesori, {D}z × {P}sl = {total_slots} sloturi/profesor"
+        + (f" ⚠ profesori supraîncărcați: {', '.join(teacher_slot_issues)}" if teacher_slot_issues else " ✓")
     )
 
     # Per profesor
