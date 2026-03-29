@@ -29,7 +29,7 @@
 #   - Start from first slot (no gaps at day start for class)
 
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Union
 from pydantic import BaseModel
 from ortools.sat.python import cp_model
 from collections import defaultdict, Counter
@@ -71,7 +71,7 @@ class RoomConfig(BaseModel):
 
 class SoftRules(BaseModel):
     avoidGapsForTeachers:        bool = True
-    avoidLastHourForStages:      list[str] = ['primary', 'middle']
+    avoidLastHourForStages:      Union[list[str], bool] = ['primary', 'middle']
     avoidSameSubjectTwicePerDay: bool = True
     hardSubjectsMorning:         bool = False  # needs subject difficulty info
     startFromFirstSlot:          bool = True
