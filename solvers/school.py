@@ -113,6 +113,7 @@ class SchoolResponse(BaseModel):
     timetable: list[Lesson]
     violations: list[SchoolViolation]
     stats: SchoolStats
+    debug_log: list[dict] = []
 
 
 def analyze_infeasibility(payload, class_subjects, asgn_periods, subject_idx, class_idx,
@@ -226,6 +227,8 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     class_idx   = {c.id: i for i, c in enumerate(classes)}
     room_idx    = {r.id: i for i, r in enumerate(rooms)}
 
+    debug_log: list[dict] = []   # structured log returned to client
+
     logger.info(f"=== School solver start ===")
     logger.info(f"  Teachers: {[t.name for t in teachers]}")
     logger.info(f"  Subjects: {[s.name for s in subjects]}")
@@ -252,6 +255,8 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
         cname = classes[ci].name
         sname = subjects[sui].name
         logger.info(f"  Assignment: {tname} → {sname} → {cname} × {a.periods_per_week}h/w consec={a.requires_consecutive}")
+        debug_log.append({"type": "assignment", "teacher": tname, "subject": sname, "class": cname,
+                          "periods_per_week": a.periods_per_week, "consecutive": a.requires_consecutive})
 
     # Teacher → subjects
     teacher_can_teach: dict[int, set[int]] = {
@@ -473,6 +478,9 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     status_name = solver.status_name(status)
     logger.info(f"School solver: {status_name} in {solver.wall_time:.2f}s")
     logger.info(f"  Objective value: {solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else 'N/A'}")
+    debug_log.append({"type": "solver_status", "status": status_name,
+                      "time_seconds": round(solver.wall_time, 2),
+                      "feasible": status in (cp_model.OPTIMAL, cp_model.FEASIBLE)})
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         total = sum(asgn_periods.get((class_idx.get(a.class_id,-1),
@@ -515,10 +523,27 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     ]
 
     logger.info(f"  Lessons generated: {len(timetable)}")
-    # Summary per teacher
+    # Summary per teacher — show slot counts to detect duplicates
+    from collections import Counter
     for ti, t in enumerate(teachers):
         t_lessons = [l for l in timetable if l.teacher_id == t.id]
-        logger.info(f"  {t.name}: {len(t_lessons)} lessons → {sorted(set((l.day, l.period) for l in t_lessons))}")
+        slot_counts = Counter((l.day, l.period) for l in t_lessons)
+        duplicates = {slot: cnt for slot, cnt in slot_counts.items() if cnt > 1}
+        if duplicates:
+            logger.error(f"  {t.name}: {len(t_lessons)} lessons — DUPLICATE SLOTS: {duplicates}")
+            debug_log.append({"type": "teacher_result", "teacher": t.name, "lessons": len(t_lessons),
+                              "slots": sorted(slot_counts.keys()), "duplicates": duplicates,
+                              "warning": f"CONFLICT: profesor în {len(duplicates)} sloturi duble"})
+        else:
+            logger.info(f"  {t.name}: {len(t_lessons)} lessons → {sorted(slot_counts.keys())}")
+            # Compute max consecutive per day
+            days_active = {}
+            for l in t_lessons:
+                days_active.setdefault(l.day, []).append(l.period)
+            max_per_day = max((len(v) for v in days_active.values()), default=0)
+            debug_log.append({"type": "teacher_result", "teacher": t.name, "lessons": len(t_lessons),
+                              "slots": sorted(slot_counts.keys()), "days_active": len(days_active),
+                              "max_per_day": max_per_day})
 
     # Post-solve validation — detect teacher conflicts
     teacher_slots: dict[tuple, list] = {}
@@ -568,7 +593,10 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                 for ci in range(len(classes)) for sui in class_subjects[ci])
 
     logger.info(f"=== School solver done: {len(timetable)}/{total} lessons, {len(violations)} violations ===")
+    debug_log.append({"type": "summary", "total": total, "scheduled": len(timetable),
+                      "violations": len(violations), "teacher_windows": total_windows})
     return SchoolResponse(timetable=timetable, violations=violations,
+        debug_log=debug_log,
         stats=SchoolStats(total_lessons=total, scheduled_lessons=len(timetable),
             teacher_windows=total_windows, solver_status=status_name,
             solve_time_seconds=solver.wall_time))
