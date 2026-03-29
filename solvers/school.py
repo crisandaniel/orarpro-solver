@@ -51,6 +51,7 @@ class Lesson(BaseModel):
 
 class TeacherConfig(BaseModel):
     id: str
+    name: str = ''
     max_lessons_per_day:  Optional[int] = None
     max_lessons_per_week: Optional[int] = None
     min_lessons_per_week: Optional[int] = None
@@ -58,6 +59,7 @@ class TeacherConfig(BaseModel):
 
 class ClassConfig(BaseModel):
     id: str
+    name: str = ''
     name: str
     stage: str = 'high'               # primary/middle/high/university
     max_lessons_per_day: int = 8
