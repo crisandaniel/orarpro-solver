@@ -486,6 +486,18 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
         for (ti, sui, ci, ri, d, p), v in x.items() if solver.value(v) == 1
     ]
 
+    # Post-solve validation — detect teacher conflicts
+    teacher_slots: dict[tuple, list] = {}
+    for lesson in timetable:
+        slot = (lesson.teacher_id, lesson.day, lesson.period)
+        teacher_slots.setdefault(slot, []).append(lesson.class_id)
+    conflicts = {k: v for k, v in teacher_slots.items() if len(v) > 1}
+    if conflicts:
+        logger.error(f"TEACHER CONFLICT in solution! {len(conflicts)} slots with multiple classes:")
+        for (tid, d, p), classes_list in list(conflicts.items())[:3]:
+            tname = next((t.name for t in teachers if t.id == tid), tid)
+            logger.error(f"  {tname} day={d} period={p}: {classes_list}")
+
     total_windows = 0
     for ti in range(len(teachers)):
         for d in range(D):
