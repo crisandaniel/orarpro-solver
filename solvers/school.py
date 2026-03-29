@@ -28,8 +28,8 @@ class Teacher(BaseModel):
     id: str
     name: str
     subject_ids: list[str]
-    max_periods_per_day: int = 6
-    max_periods_per_week: int = 20
+    max_periods_per_day: int = 8
+    max_periods_per_week: int = 40
     unavailable_periods: list[dict] = []
 
 class Subject(BaseModel):
