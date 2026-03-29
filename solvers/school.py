@@ -1,24 +1,38 @@
-# orarpro-solver/solvers/school.py  (v3 — simplified)
+# orarpro-solver/solvers/school.py  (v4)
 #
-# Variables: x[class, subject, day, period] ∈ {0,1}
-# No teachers, no rooms in the model — assigned as metadata post-solve.
+# Input model (v4 — Lesson-based, allowedSlots pre-calculated):
+#   Lessons:  atomic units with allowed_slots, duration, teacher/class/subject
+#   Teachers: limits (max/min per day/week) + preferred slots (soft)
+#   Classes:  max_lessons_per_day, stage
+#   Rooms:    type (for preferred_room matching)
+#   SoftRules: weights for objective
+#
+# Variables:
+#   x[lesson_id][slot] ∈ {0,1}  — is lesson placed in this slot?
+#   For duration=2: x[lesson_id][slot] means it occupies slot AND slot+1
 #
 # HARD constraints:
-#   1. Coverage: exactly periods_per_week lessons per (class, subject)
-#   2. Class once per slot: at most one subject per (class, day, period)
-#   3. Max 1 same subject per day (or 2 if consecutive)
-#   4. Consecutive pairs on same day, adjacent periods
-#   5. No windows for classes: lessons compact, no gaps between first and last
+#   1. Each lesson placed exactly once
+#   2. Lesson only in allowed_slots
+#   3. Teacher once per slot
+#   4. Class once per slot
+#   5. Room once per slot (if room assigned)
+#   6. Duration=2: consecutive slots in same day
+#   7. Teacher max/min per day/week
+#   8. Class max per day
 #
-# SOFT (objective):
-#   - Start from period 0 each day (penalize gaps at start)
+# SOFT (objective, weighted):
+#   - Teacher gaps (windows between lessons)
+#   - Last slot for young classes (primary/middle)
+#   - Same subject twice per day per class
 #   - Hard subjects in morning
+#   - Start from first slot (no gaps at day start for class)
 
 from __future__ import annotations
 from typing import Optional
 from pydantic import BaseModel
 from ortools.sat.python import cp_model
-from collections import Counter
+from collections import defaultdict, Counter
 import logging
 
 logger = logging.getLogger(__name__)
@@ -26,39 +40,70 @@ logger = logging.getLogger(__name__)
 
 # ── Input models ──────────────────────────────────────────────────────────────
 
-class ClassSubject(BaseModel):
+class Lesson(BaseModel):
+    id: str
     class_id: str
     subject_id: str
-    teacher_id: str                   # required — used for conflict constraints
-    periods_per_week: int
-    requires_consecutive: bool = False
-    preferred_morning: bool = False   # soft: schedule early
+    teacher_id: str
+    duration: int = 1                   # 1 or 2 (double period)
+    allowed_slots: list[str]            # "day-period" strings
+    preferred_room_id: Optional[str] = None
 
-class SchoolConfig(BaseModel):
-    avoid_windows: bool = True
-    hard_subjects_morning: bool = True
-    start_from_first_period: bool = True
-    max_periods_per_day: int = 7
-    min_periods_per_day: int = 1
+class TeacherConfig(BaseModel):
+    id: str
+    max_lessons_per_day:  Optional[int] = None
+    max_lessons_per_week: Optional[int] = None
+    min_lessons_per_week: Optional[int] = None
+    preferred_slots: list[str] = []
+
+class ClassConfig(BaseModel):
+    id: str
+    name: str
+    stage: str = 'high'               # primary/middle/high/university
+    max_lessons_per_day: int = 8
+
+class RoomConfig(BaseModel):
+    id: str
+    name: str
+    type: str = 'generic'
+
+class SoftRules(BaseModel):
+    avoidGapsForTeachers:        bool = True
+    avoidLastHourForStages:      list[str] = ['primary', 'middle']
+    avoidSameSubjectTwicePerDay: bool = True
+    hardSubjectsMorning:         bool = False  # needs subject difficulty info
+    startFromFirstSlot:          bool = True
+    weights: dict = {
+        'teacherGaps':  80,
+        'lastHour':     60,
+        'sameSubject':  70,
+        'hardMorning':  50,
+        'startFirst':   90,
+    }
 
 class SchoolRequest(BaseModel):
     schedule_id: str
-    class_ids: list[str]
-    subject_ids: list[str]
-    class_subjects: list[ClassSubject]
+    lessons: list[Lesson]
+    teachers: list[TeacherConfig] = []
+    classes: list[ClassConfig] = []
+    rooms: list[RoomConfig] = []
     days_per_week: int = 5
-    periods_per_day: int = 7
-    config: Optional[SchoolConfig] = None
+    slots_per_day: int = 8
+    soft_rules: SoftRules = SoftRules()
     solver_time_limit_seconds: int = 50
 
 
 # ── Output models ─────────────────────────────────────────────────────────────
 
-class Lesson(BaseModel):
+class PlacedLesson(BaseModel):
+    lesson_id: str
     class_id: str
     subject_id: str
+    teacher_id: str
+    room_id: Optional[str] = None
     day: int
     period: int
+    duration: int = 1
 
 class SchoolViolation(BaseModel):
     type: str
@@ -69,162 +114,258 @@ class SchoolStats(BaseModel):
     scheduled_lessons: int
     solver_status: str
     solve_time_seconds: float
+    objective_value: Optional[float] = None
 
 class SchoolResponse(BaseModel):
-    timetable: list[Lesson]
+    timetable: list[PlacedLesson]
     violations: list[SchoolViolation]
     stats: SchoolStats
     debug_log: list[dict] = []
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def parse_slot(slot: str) -> tuple[int, int]:
+    """Parse "day-period" string to (day, period) ints."""
+    parts = slot.split('-')
+    return int(parts[0]), int(parts[1])
 
 
 # ── Solver ────────────────────────────────────────────────────────────────────
 
 def solve_school(payload: SchoolRequest) -> SchoolResponse:
     D   = payload.days_per_week
-    P   = payload.periods_per_day
-    cfg = payload.config or SchoolConfig()
-
+    P   = payload.slots_per_day
+    cfg = payload.soft_rules
     debug_log: list[dict] = []
 
-    logger.info(f"=== School solver v3 start ===")
-    logger.info(f"  Classes: {len(payload.class_ids)}, Subjects: {len(payload.subject_ids)}")
-    logger.info(f"  Assignments: {len(payload.class_subjects)}, D={D} P={P}")
-    logger.info(f"  Config: start_first={cfg.start_from_first_period} avoid_win={cfg.avoid_windows}")
+    logger.info(f"=== School solver v4 ===")
+    logger.info(f"  {len(payload.lessons)} lessons, {D}d × {P}p = {D*P} slots")
+    logger.info(f"  teachers: {len(payload.teachers)}, classes: {len(payload.classes)}")
 
-    for cs in payload.class_subjects:
-        logger.info(f"  CS: class={cs.class_id[:8]} subj={cs.subject_id[:8]} teacher={cs.teacher_id[:8]} n={cs.periods_per_week} consec={cs.requires_consecutive}")
-        debug_log.append({"type": "assignment",
-                          "class_id": cs.class_id, "subject_id": cs.subject_id,
-                          "teacher_id": cs.teacher_id,
-                          "periods_per_week": cs.periods_per_week,
-                          "consecutive": cs.requires_consecutive})
+    # Index configs
+    teacher_cfg = {t.id: t for t in payload.teachers}
+    class_cfg   = {c.id: c for c in payload.classes}
+
+    # Log assignments
+    for l in payload.lessons:
+        logger.info(f"  Lesson {l.id}: class={l.class_id[:8]} subj={l.subject_id[:8]} "
+                    f"teacher={l.teacher_id[:8]} dur={l.duration} allowed={len(l.allowed_slots)} slots")
+        debug_log.append({
+            "type":       "assignment",
+            "lesson_id":  l.id,
+            "class_id":   l.class_id,
+            "subject_id": l.subject_id,
+            "teacher_id": l.teacher_id,
+            "duration":   l.duration,
+            "allowed":    len(l.allowed_slots),
+            "weekly_hours": 1,  # each lesson = 1 unit
+        })
 
     model = cp_model.CpModel()
 
-    # x[(ci, si, d, p)] = 1 if class ci has subject si at day d period p
-    x: dict[tuple, cp_model.IntVar] = {}
-    cs_map = {(cs.class_id, cs.subject_id): cs for cs in payload.class_subjects}
+    # ── Variables ─────────────────────────────────────────────────────────────
+    # x[lesson_id][slot_str] = BoolVar
+    # Only create vars for allowed slots
+    x: dict[str, dict[str, cp_model.IntVar]] = {}
+    for lesson in payload.lessons:
+        x[lesson.id] = {}
+        valid_slots = lesson.allowed_slots
+        # For duration=2, filter out slots where next slot (same day) doesn't exist
+        if lesson.duration == 2:
+            valid_slots = [
+                s for s in valid_slots
+                if (d := parse_slot(s))[1] < P - 1  # not last slot of day
+                and f"{d[0]}-{d[1]+1}" in lesson.allowed_slots  # next slot also allowed
+            ]
+        for slot in valid_slots:
+            x[lesson.id][slot] = model.new_bool_var(f"x_{lesson.id[:8]}_{slot}")
 
-    for cs in payload.class_subjects:
-        ci = cs.class_id
-        si = cs.subject_id
+    total_vars = sum(len(slots) for slots in x.values())
+    logger.info(f"  Variables: {total_vars}")
+    debug_log.append({"type": "variables", "count": total_vars})
+
+    # ── HARD 1: Each lesson placed exactly once ───────────────────────────────
+    for lesson in payload.lessons:
+        slot_vars = list(x[lesson.id].values())
+        if not slot_vars:
+            logger.warning(f"  Lesson {lesson.id}: NO valid slots!")
+        model.add(sum(slot_vars) == 1)
+
+    # ── HARD 2: Teacher once per slot ─────────────────────────────────────────
+    # Group lessons by teacher
+    teacher_lessons: dict[str, list[Lesson]] = defaultdict(list)
+    for lesson in payload.lessons:
+        teacher_lessons[lesson.teacher_id].append(lesson)
+
+    for teacher_id, lessons in teacher_lessons.items():
         for d in range(D):
             for p in range(P):
-                x[(ci, si, d, p)] = model.new_bool_var(f"x_{ci[:6]}_{si[:6]}_d{d}_p{p}")
+                slot = f"{d}-{p}"
+                vars_at_slot = []
+                for l in lessons:
+                    if slot in x[l.id]:
+                        vars_at_slot.append(x[l.id][slot])
+                    # Duration=2 occupies slot AND slot+1
+                    if l.duration == 2:
+                        prev = f"{d}-{p-1}" if p > 0 else None
+                        if prev and prev in x[l.id]:
+                            vars_at_slot.append(x[l.id][prev])
+                if len(vars_at_slot) > 1:
+                    model.add(sum(vars_at_slot) <= 1)
 
-    logger.info(f"  Variables: {len(x)}")
-    debug_log.append({"type": "variables", "count": len(x)})
+    # ── HARD 3: Class once per slot ───────────────────────────────────────────
+    class_lessons: dict[str, list[Lesson]] = defaultdict(list)
+    for lesson in payload.lessons:
+        class_lessons[lesson.class_id].append(lesson)
 
-    def slots(ci=None, si=None, d=None, p=None):
-        return [v for (c2, s2, d2, p2), v in x.items()
-                if (ci is None or c2 == ci) and (si is None or s2 == si)
-                and (d is None or d2 == d) and (p is None or p2 == p)]
-
-    # ── HARD 1: Coverage ─────────────────────────────────────────────────────
-    for cs in payload.class_subjects:
-        s = slots(ci=cs.class_id, si=cs.subject_id)
-        if s:
-            model.add(sum(s) == cs.periods_per_week)
-
-    # ── HARD 2: Class once per slot ───────────────────────────────────────────
-    for ci in payload.class_ids:
+    for class_id, lessons in class_lessons.items():
         for d in range(D):
             for p in range(P):
-                s = slots(ci=ci, d=d, p=p)
-                if s: model.add(sum(s) <= 1)
+                slot = f"{d}-{p}"
+                vars_at_slot = []
+                for l in lessons:
+                    if slot in x[l.id]:
+                        vars_at_slot.append(x[l.id][slot])
+                    if l.duration == 2:
+                        prev = f"{d}-{p-1}" if p > 0 else None
+                        if prev and prev in x[l.id]:
+                            vars_at_slot.append(x[l.id][prev])
+                if len(vars_at_slot) > 1:
+                    model.add(sum(vars_at_slot) <= 1)
 
-    # ── HARD 3: Teacher once per slot ────────────────────────────────────────
-    # Group assignments by teacher — teacher cannot be in two classes at same time
-    from collections import defaultdict
-    teacher_cs: dict[str, list[ClassSubject]] = defaultdict(list)
-    for cs in payload.class_subjects:
-        teacher_cs[cs.teacher_id].append(cs)
-
-    for teacher_id, cs_list in teacher_cs.items():
-        if len(cs_list) <= 1:
-            continue  # single assignment — no conflict possible
-        for d in range(D):
-            for p in range(P):
-                teacher_slots = []
-                for cs in cs_list:
-                    s = slots(ci=cs.class_id, si=cs.subject_id, d=d, p=p)
-                    teacher_slots.extend(s)
-                if len(teacher_slots) > 1:
-                    model.add(sum(teacher_slots) <= 1)
-                    logger.debug(f"  Teacher {teacher_id[:8]} conflict constraint at d={d} p={p}: {len(teacher_slots)} vars")
-
-    # ── HARD 4: Max same subject per day ──────────────────────────────────────
-    for cs in payload.class_subjects:
-        max_per_day = 2 if cs.requires_consecutive else 1
-        for d in range(D):
-            s = slots(ci=cs.class_id, si=cs.subject_id, d=d)
-            if s: model.add(sum(s) <= max_per_day)
-
-    # ── HARD 4: Consecutive pairs ─────────────────────────────────────────────
-    for cs in payload.class_subjects:
-        if not cs.requires_consecutive:
+    # ── HARD 4: Teacher max per day/week ──────────────────────────────────────
+    for teacher_id, lessons in teacher_lessons.items():
+        tcfg = teacher_cfg.get(teacher_id)
+        if not tcfg:
             continue
-        for d in range(D):
-            for p in range(P - 1):
-                at_p  = slots(ci=cs.class_id, si=cs.subject_id, d=d, p=p)
-                at_p1 = slots(ci=cs.class_id, si=cs.subject_id, d=d, p=p+1)
-                if at_p and at_p1:
-                    bp  = model.new_bool_var(f"cp_{cs.class_id[:6]}_{cs.subject_id[:6]}_d{d}_p{p}")
-                    bp1 = model.new_bool_var(f"cp_{cs.class_id[:6]}_{cs.subject_id[:6]}_d{d}_p{p}1")
-                    model.add(sum(at_p)  == bp)
-                    model.add(sum(at_p1) == bp1)
-                    model.add(bp == bp1)
-
-    # ── HARD 5: No windows for classes ────────────────────────────────────────
-    # If class has lessons at p1 and p2 (p1<p2) on day d, all periods between must be filled
-    for ci in payload.class_ids:
-        for d in range(D):
-            for p1 in range(P):
-                for p2 in range(p1 + 2, P):
-                    at_p1 = slots(ci=ci, d=d, p=p1)
-                    at_p2 = slots(ci=ci, d=d, p=p2)
-                    for pmid in range(p1 + 1, p2):
-                        at_mid = slots(ci=ci, d=d, p=pmid)
-                        if not at_p1 or not at_p2 or not at_mid:
-                            continue
-                        b1   = model.new_bool_var(f"nw_{ci[:6]}_d{d}_{p1}_{p2}_b1")
-                        b2   = model.new_bool_var(f"nw_{ci[:6]}_d{d}_{p1}_{p2}_b2")
-                        bmid = model.new_bool_var(f"nw_{ci[:6]}_d{d}_{p1}_{p2}_m{pmid}")
-                        model.add(sum(at_p1)  == b1)
-                        model.add(sum(at_p2)  == b2)
-                        model.add(sum(at_mid) == bmid)
-                        both = model.new_bool_var(f"nw_{ci[:6]}_d{d}_{p1}_{p2}_both{pmid}")
-                        model.add_bool_and([b1, b2]).only_enforce_if(both)
-                        model.add_bool_or([b1.negated(), b2.negated()]).only_enforce_if(both.negated())
-                        model.add(bmid >= both)
-
-    # ── SOFT: start from period 0 ─────────────────────────────────────────────
-    objective = []
-    if cfg.start_from_first_period:
-        for ci in payload.class_ids:
+        # Per day
+        if tcfg.max_lessons_per_day:
             for d in range(D):
-                at_zero = slots(ci=ci, d=d, p=0)
-                at_rest = [v for (c2,s2,d2,p2),v in x.items() if c2==ci and d2==d and p2>0]
-                if not at_zero or not at_rest:
+                day_vars = [
+                    v for l in lessons
+                    for slot, v in x[l.id].items()
+                    if parse_slot(slot)[0] == d
+                ]
+                if day_vars:
+                    model.add(sum(day_vars) <= tcfg.max_lessons_per_day)
+        # Per week
+        if tcfg.max_lessons_per_week:
+            all_vars = [v for l in lessons for v in x[l.id].values()]
+            if all_vars:
+                model.add(sum(all_vars) <= tcfg.max_lessons_per_week)
+        # Min per week (normă)
+        if tcfg.min_lessons_per_week:
+            all_vars = [v for l in lessons for v in x[l.id].values()]
+            if all_vars:
+                model.add(sum(all_vars) >= tcfg.min_lessons_per_week)
+
+    # ── HARD 5: Class max per day ─────────────────────────────────────────────
+    for class_id, lessons in class_lessons.items():
+        ccfg = class_cfg.get(class_id)
+        max_pd = ccfg.max_lessons_per_day if ccfg else 8
+        for d in range(D):
+            day_vars = [
+                v for l in lessons
+                for slot, v in x[l.id].items()
+                if parse_slot(slot)[0] == d
+            ]
+            if day_vars:
+                model.add(sum(day_vars) <= max_pd)
+
+    # ── SOFT objective ────────────────────────────────────────────────────────
+    objective = []
+    w = cfg.weights
+
+    # Teacher gaps (windows between lessons on same day)
+    if cfg.avoidGapsForTeachers and w.get('teacherGaps', 0) > 0:
+        weight = w['teacherGaps']
+        for teacher_id, lessons in teacher_lessons.items():
+            for d in range(D):
+                worked: list[tuple[int, cp_model.IntVar]] = []
+                for p in range(P):
+                    slot = f"{d}-{p}"
+                    slot_vars = [x[l.id][slot] for l in lessons if slot in x[l.id]]
+                    if slot_vars:
+                        w_var = model.new_bool_var(f"tw_{teacher_id[:6]}_d{d}_p{p}")
+                        model.add(sum(slot_vars) >= w_var)
+                        model.add(sum(slot_vars) <= w_var)
+                        worked.append((p, w_var))
+                for i, (p1, w1) in enumerate(worked):
+                    for p2, w2 in worked[i+1:]:
+                        gap = p2 - p1 - 1
+                        if gap <= 0:
+                            continue
+                        both = model.new_bool_var(f"gap_{teacher_id[:6]}_d{d}_{p1}_{p2}")
+                        model.add_bool_and([w1, w2]).only_enforce_if(both)
+                        model.add_bool_or([w1.negated(), w2.negated()]).only_enforce_if(both.negated())
+                        objective.append(both * gap * weight)
+
+    # Avoid last slot for young classes
+    if cfg.avoidLastHourForStages and w.get('lastHour', 0) > 0:
+        weight = w['lastHour']
+        last_slot_per_day = {d: f"{d}-{P-1}" for d in range(D)}
+        young_classes = {c.id for c in payload.classes if c.stage in cfg.avoidLastHourForStages}
+        for lesson in payload.lessons:
+            if lesson.class_id in young_classes:
+                for d in range(D):
+                    last = last_slot_per_day[d]
+                    if last in x[lesson.id]:
+                        objective.append(x[lesson.id][last] * weight)
+
+    # Avoid same subject twice per day per class
+    if cfg.avoidSameSubjectTwicePerDay and w.get('sameSubject', 0) > 0:
+        weight = w['sameSubject']
+        subj_class_lessons: dict[tuple, list[Lesson]] = defaultdict(list)
+        for lesson in payload.lessons:
+            subj_class_lessons[(lesson.subject_id, lesson.class_id)].append(lesson)
+        for (subj_id, class_id), lessons in subj_class_lessons.items():
+            if len(lessons) <= 1:
+                continue
+            for d in range(D):
+                day_vars = [x[l.id][s] for l in lessons for s in x[l.id] if parse_slot(s)[0] == d]
+                if len(day_vars) > 1:
+                    # Penalize having more than 1 lesson of same subject/class on same day
+                    count_var = model.new_int_var(0, len(day_vars), f"sc_{subj_id[:6]}_{class_id[:6]}_d{d}")
+                    model.add(count_var == sum(day_vars))
+                    excess = model.new_int_var(0, len(day_vars), f"ex_{subj_id[:6]}_{class_id[:6]}_d{d}")
+                    model.add(excess == count_var - 1)
+                    objective.append(excess * weight)
+
+    # Start from first slot (no gaps at start of day for class)
+    if cfg.startFromFirstSlot and w.get('startFirst', 0) > 0:
+        weight = w['startFirst']
+        for class_id, lessons in class_lessons.items():
+            for d in range(D):
+                at_zero = [x[l.id][f"{d}-0"] for l in lessons if f"{d}-0" in x[l.id]]
+                at_rest = [x[l.id][s] for l in lessons for s in x[l.id]
+                           if parse_slot(s) == (d, 0) or parse_slot(s)[0] != d]
+                at_later = [x[l.id][s] for l in lessons for s in x[l.id]
+                            if parse_slot(s)[0] == d and parse_slot(s)[1] > 0]
+                if not at_zero or not at_later:
                     continue
-                has_zero  = model.new_bool_var(f"sz_{ci[:6]}_d{d}")
-                has_later = model.new_bool_var(f"sl_{ci[:6]}_d{d}")
-                model.add(sum(at_zero) >= has_zero)
-                model.add(sum(at_zero) <= len(at_zero) * has_zero)
-                model.add(sum(at_rest) >= has_later)
-                model.add(sum(at_rest) <= len(at_rest) * has_later)
-                gap = model.new_bool_var(f"sg_{ci[:6]}_d{d}")
+                has_zero  = model.new_bool_var(f"sz_{class_id[:6]}_d{d}")
+                has_later = model.new_bool_var(f"sl_{class_id[:6]}_d{d}")
+                model.add(sum(at_zero)  >= has_zero)
+                model.add(sum(at_zero)  <= len(at_zero) * has_zero)
+                model.add(sum(at_later) >= has_later)
+                model.add(sum(at_later) <= len(at_later) * has_later)
+                gap = model.new_bool_var(f"sg_{class_id[:6]}_d{d}")
                 model.add_bool_and([has_later, has_zero.negated()]).only_enforce_if(gap)
                 model.add_bool_or([has_later.negated(), has_zero]).only_enforce_if(gap.negated())
-                objective.append(gap * 15)
+                objective.append(gap * weight)
 
-    # ── SOFT: hard subjects in morning ────────────────────────────────────────
-    if cfg.hard_subjects_morning:
-        for cs in payload.class_subjects:
-            if cs.preferred_morning:
-                for (c2,s2,d2,p2), v in x.items():
-                    if c2 == cs.class_id and s2 == cs.subject_id and p2 >= P // 2:
-                        objective.append(v)
+    # Teacher preferred slots (soft — prefer to schedule in preferred slots)
+    for tcfg in payload.teachers:
+        if not tcfg.preferred_slots:
+            continue
+        preferred_set = set(tcfg.preferred_slots)
+        lessons = teacher_lessons.get(tcfg.id, [])
+        for lesson in lessons:
+            for slot, var in x[lesson.id].items():
+                if slot not in preferred_set:
+                    # Small penalty for not being in preferred slot
+                    objective.append(var * 5)
 
     if objective:
         model.minimize(sum(objective))
@@ -237,17 +378,23 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
 
     status      = solver.solve(model)
     status_name = solver.status_name(status)
-    logger.info(f"  Status: {status_name} in {solver.wall_time:.2f}s")
-    debug_log.append({"type": "solver_status", "status": status_name,
-                      "time_seconds": round(solver.wall_time, 2),
-                      "feasible": status in (cp_model.OPTIMAL, cp_model.FEASIBLE)})
+    obj_val     = solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None
 
-    total = sum(cs.periods_per_week for cs in payload.class_subjects)
+    logger.info(f"  Status: {status_name} in {solver.wall_time:.2f}s obj={obj_val}")
+    debug_log.append({
+        "type":         "solver_status",
+        "status":       status_name,
+        "time_seconds": round(solver.wall_time, 2),
+        "feasible":     status in (cp_model.OPTIMAL, cp_model.FEASIBLE),
+        "objective":    obj_val,
+    })
+
+    total = len(payload.lessons)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        reasons = _analyze_infeasibility(payload, D, P, cfg)
+        reasons = _analyze_infeasibility(payload, teacher_lessons, class_lessons, D, P)
         for r in reasons:
-            logger.warning(f"  INFEASIBLE reason: {r}")
+            logger.warning(f"  INFEASIBLE: {r}")
         return SchoolResponse(
             timetable=[], debug_log=debug_log,
             violations=[SchoolViolation(type="infeasible", message=r) for r in reasons],
@@ -256,59 +403,110 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
         )
 
     # ── Extract ───────────────────────────────────────────────────────────────
-    timetable = [
-        Lesson(class_id=c2, subject_id=s2, day=d2, period=p2)
-        for (c2, s2, d2, p2), v in x.items() if solver.value(v) == 1
-    ]
+    timetable: list[PlacedLesson] = []
+    for lesson in payload.lessons:
+        for slot, var in x[lesson.id].items():
+            if solver.value(var) == 1:
+                d, p = parse_slot(slot)
+                timetable.append(PlacedLesson(
+                    lesson_id=  lesson.id,
+                    class_id=   lesson.class_id,
+                    subject_id= lesson.subject_id,
+                    teacher_id= lesson.teacher_id,
+                    room_id=    lesson.preferred_room_id,
+                    day=d, period=p,
+                    duration=   lesson.duration,
+                ))
 
-    # Per-class summary log
-    for ci in payload.class_ids:
-        cl = [l for l in timetable if l.class_id == ci]
-        slot_counts = Counter((l.day, l.period) for l in cl)
+    # Post-solve validation
+    from collections import Counter
+    for teacher_id in teacher_lessons:
+        t_lessons = [l for l in timetable if l.teacher_id == teacher_id]
+        slot_counts = Counter((l.day, l.period) for l in t_lessons)
         dups = {k: v for k, v in slot_counts.items() if v > 1}
         if dups:
-            logger.error(f"  CLASS CONFLICT {ci[:8]}: {dups}")
-        logger.info(f"  class {ci[:8]}: {len(cl)} lessons → {sorted(slot_counts.keys())}")
-        debug_log.append({"type": "class_result", "class_id": ci,
-                          "lessons": len(cl), "slots": sorted(slot_counts.keys()),
-                          "conflict": bool(dups)})
+            logger.error(f"  TEACHER CONFLICT {teacher_id[:8]}: {dups}")
+        logger.info(f"  teacher {teacher_id[:8]}: {len(t_lessons)} lessons → {sorted(slot_counts.keys())}")
+        debug_log.append({
+            "type":       "teacher_result",
+            "teacher_id": teacher_id,
+            "lessons":    len(t_lessons),
+            "slots":      sorted(slot_counts.keys()),
+            "conflict":   bool(dups),
+        })
 
-    # Violations
     violations = []
-    for cs in payload.class_subjects:
-        got = sum(1 for l in timetable if l.class_id == cs.class_id and l.subject_id == cs.subject_id)
-        if got < cs.periods_per_week:
-            msg = f"class={cs.class_id[:8]} subj={cs.subject_id[:8]}: {got}/{cs.periods_per_week} ore"
-            violations.append(SchoolViolation(type="underscheduled", message=msg))
-            logger.warning(f"  UNDERSCHEDULED: {msg}")
+    placed_count = Counter(l.lesson_id for l in timetable)
+    for lesson in payload.lessons:
+        if placed_count.get(lesson.id, 0) == 0:
+            violations.append(SchoolViolation(
+                type="unscheduled",
+                message=f"Lecție neplanificată: class={lesson.class_id[:8]} subj={lesson.subject_id[:8]}"
+            ))
 
-    debug_log.append({"type": "summary", "total": total, "scheduled": len(timetable),
-                      "violations": len(violations)})
+    debug_log.append({
+        "type":       "summary",
+        "total":      total,
+        "scheduled":  len(timetable),
+        "violations": len(violations),
+    })
     logger.info(f"=== Done: {len(timetable)}/{total} lessons, {len(violations)} violations ===")
 
-    return SchoolResponse(timetable=timetable, violations=violations, debug_log=debug_log,
-        stats=SchoolStats(total_lessons=total, scheduled_lessons=len(timetable),
-                          solver_status=status_name, solve_time_seconds=solver.wall_time))
+    return SchoolResponse(
+        timetable=timetable, violations=violations, debug_log=debug_log,
+        stats=SchoolStats(
+            total_lessons=total, scheduled_lessons=len(timetable),
+            solver_status=status_name, solve_time_seconds=solver.wall_time,
+            objective_value=obj_val,
+        )
+    )
 
 
-def _analyze_infeasibility(payload: SchoolRequest, D: int, P: int, cfg: SchoolConfig) -> list[str]:
+def _analyze_infeasibility(payload, teacher_lessons, class_lessons, D, P):
+    """Fast pre-solve analysis to give human-readable infeasibility reasons."""
     reasons = []
-    for cs in payload.class_subjects:
-        max_possible = D * 2 if cs.requires_consecutive else D
-        if cs.periods_per_week > max_possible:
+
+    for lesson in payload.lessons:
+        if not x_has_slots(lesson, D, P):
+            reasons.append(f"Lecție fără sloturi valide: class={lesson.class_id[:8]} teacher={lesson.teacher_id[:8]}")
+
+    for teacher_id, lessons in teacher_lessons.items():
+        total = len(lessons)
+        tcfg = next((t for t in payload.teachers if t.id == teacher_id), None)
+        if tcfg and tcfg.max_lessons_per_week and total > tcfg.max_lessons_per_week:
             reasons.append(
-                f"Clasa {cs.class_id[:8]}, materia {cs.subject_id[:8]}: "
-                f"{cs.periods_per_week} ore/săpt > {max_possible} maxim posibil"
+                f"Profesor {teacher_id[:8]}: {total} lecții > max {tcfg.max_lessons_per_week}/săpt"
             )
-    total_per_class: dict[str, int] = {}
-    for cs in payload.class_subjects:
-        total_per_class[cs.class_id] = total_per_class.get(cs.class_id, 0) + cs.periods_per_week
-    for ci, total in total_per_class.items():
-        if total > D * P:
-            reasons.append(f"Clasa {ci[:8]}: total {total} ore/săpt > {D*P} sloturi disponibile")
+        # Check if enough valid slots
+        unique_slots_per_lesson = [len(x_get_slots(l, D, P)) for l in lessons]
+        if sum(1 for s in unique_slots_per_lesson if s == 0) > 0:
+            reasons.append(f"Profesor {teacher_id[:8]}: unele lecții nu au sloturi valide")
+
+    for class_id, lessons in class_lessons.items():
+        total = len(lessons)
+        ccfg = next((c for c in payload.classes if c.id == class_id), None)
+        max_pd = ccfg.max_lessons_per_day if ccfg else 8
+        if total > D * max_pd:
+            reasons.append(
+                f"Clasă {class_id[:8]}: {total} lecții > {D}z × {max_pd} = {D*max_pd} sloturi"
+            )
+
     if not reasons:
         reasons.append(
-            "Constrângerile combinate fac orarul imposibil. "
-            "Verifică numărul de ore pe săptămână per clasă."
+            "Constrângerile combinate sunt incompatibile. "
+            "Verifică indisponibilitățile profesorilor, limitele de ore/zi și numărul total de ore."
         )
     return reasons
+
+
+def x_has_slots(lesson, D, P):
+    slots = lesson.allowed_slots
+    if lesson.duration == 2:
+        slots = [s for s in slots
+                 if (dp := (int(s.split('-')[0]), int(s.split('-')[1])))[1] < P - 1
+                 and f"{dp[0]}-{dp[1]+1}" in lesson.allowed_slots]
+    return len(slots) > 0
+
+
+def x_get_slots(lesson, D, P):
+    return lesson.allowed_slots
