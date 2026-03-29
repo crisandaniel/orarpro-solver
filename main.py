@@ -21,13 +21,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="OrarPro Solver",
     description="CP-SAT schedule generation engine using Google OR-Tools",
-    version="1.0.0",
+    version="2.0.0",
 )
 
-# Allow requests from Vercel (Next.js) and localhost
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict to your Vercel URL in production
+    allow_origins=["*"],
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
@@ -43,14 +42,7 @@ def health():
 async def solve_shifts_endpoint(payload: ShiftsRequest) -> ShiftsResponse:
     """
     Shift scheduling for HoReCa, factories, retail, clinics.
-
     Input: employees, shift definitions, working dates, constraints.
-    Output: assignments (employee × shift × date) + violations + stats.
-
-    Uses CP-SAT to find a feasible solution that:
-    - Covers the required number of employees per shift per day
-    - Respects all hard constraints (rest, consecutive days, pairs, seniority)
-    - Minimizes soft constraint violations (balance, consistency)
     """
     logger.info(
         f"Solving shifts: {len(payload.employees)} employees, "
@@ -67,23 +59,14 @@ async def solve_shifts_endpoint(payload: ShiftsRequest) -> ShiftsResponse:
 @app.post("/solve/school", response_model=SchoolResponse)
 async def solve_school_endpoint(payload: SchoolRequest) -> SchoolResponse:
     """
-    Timetable scheduling for schools and universities.
-
-    Input: teachers, subjects, classes, rooms, periods, constraints.
-    Output: timetable (teacher × subject × class × room × period) + violations.
-
-    Uses CP-SAT to find a feasible timetable that:
-    - Each subject gets the required number of periods per week
-    - No teacher is in two rooms simultaneously
-    - No room has two classes simultaneously
-    - No class has two subjects at the same time
-    - Minimizes teacher free periods (windows) between lessons
+    Timetable scheduling for schools (v3 — class×subject model, no teachers/rooms).
+    Input: class_subjects with periods_per_week, config.
+    Output: timetable (class × subject × day × period) + violations + debug_log.
     """
     logger.info(
-        f"Solving school timetable: {len(payload.teachers)} teachers, "
-        f"{len(payload.subjects)} subjects, "
-        f"{len(payload.classes)} classes, "
-        f"{len(payload.rooms)} rooms, "
+        f"Solving school timetable: {len(payload.class_ids)} classes, "
+        f"{len(payload.subject_ids)} subjects, "
+        f"{len(payload.class_subjects)} assignments, "
         f"{payload.periods_per_day} periods/day"
     )
     try:
