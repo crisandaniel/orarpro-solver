@@ -557,16 +557,51 @@ def _analyze_infeasibility(payload, teacher_lessons, class_lessons, D, P):
                 f"{len(all_allowed)} sloturi unice disponibile — imposibil fără suprapuneri"
             )
 
-    # ── Fallback — dacă nu am găsit nimic specific ──────────────────────────
-    if not reasons:
-        # Cel puțin afișăm statistici utile
-        total_lessons = len(payload.lessons)
-        total_avail   = sum(len(l.allowed_slots) for l in payload.lessons)
+    # ── 5. Sumar intrări (mereu afișat — util pentru debug) ────────────────
+    from collections import defaultdict
+
+    # Total ore per clasă
+    class_hours: dict[str, int] = defaultdict(int)
+    # Total ore per profesor
+    teacher_hours: dict[str, int] = defaultdict(int)
+    # Detaliu: profesor → {clasă: ore}
+    teacher_class_hours: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    for lesson in payload.lessons:
+        cname = class_names.get(lesson.class_id, lesson.class_id[:8])
+        tname = teacher_names.get(lesson.teacher_id, lesson.teacher_id[:8])
+        class_hours[cname]   += 1
+        teacher_hours[tname] += 1
+        teacher_class_hours[tname][cname] += 1
+
+    total_lessons = len(payload.lessons)
+
+    # Sumar general
+    reasons.append(
+        f"[SUMAR] {total_lessons} lecții totale pentru {len(class_hours)} clase "
+        f"în {D} zile × {P} sloturi = {total_slots} sloturi disponibile"
+        + (f" ⚠ IMPOSIBIL: {total_lessons} > {total_slots}" if total_lessons > total_slots else " ✓ nr. sloturi ok")
+    )
+
+    # Per profesor
+    for tname, total in sorted(teacher_hours.items(), key=lambda x: -x[1]):
+        tcfg = next((t for t in payload.teachers if teacher_names.get(t.id) == tname), None)
+        max_w = tcfg.max_lessons_per_week if tcfg and tcfg.max_lessons_per_week else '∞'
+        max_d = tcfg.max_lessons_per_day  if tcfg and tcfg.max_lessons_per_day  else '∞'
+        clase_str = ', '.join(f"{c}:{h}h" for c, h in sorted(teacher_class_hours[tname].items()))
+        status = f" ⚠ depășit ({total}>{max_w})" if isinstance(max_w, int) and total > max_w else ''
         reasons.append(
-            f"Constrângerile combinate sunt incompatibile ({total_lessons} lecții, "
-            f"{total_avail} sloturi disponibile total, {D}z × {P}sl = {total_slots} sloturi). "
-            f"Verifică: indisponibilitățile profesorilor, max ore/zi per clasă și profesor, "
-            f"și numărul total de ore asignate."
+            f"[PROF] {tname}: {total}h/săpt (max {max_w}/săpt, {max_d}/zi){status} → {clase_str}"
+        )
+
+    # Per clasă
+    for cname, total in sorted(class_hours.items()):
+        ccfg = next((c for c in payload.classes if class_names.get(c.id) == cname), None)
+        max_pd = ccfg.max_lessons_per_day if ccfg else P
+        max_total = D * max_pd
+        status = f" ⚠ depășit ({total}>{max_total})" if total > max_total else ''
+        reasons.append(
+            f"[CLASĂ] {cname}: {total}h/săpt (max {max_pd}/zi × {D}z = {max_total}){status}"
         )
 
     return reasons
