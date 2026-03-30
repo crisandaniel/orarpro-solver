@@ -429,6 +429,13 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     logger.info(f"  Total objective terms: {len(objective)}")
     logger.info("  === END CONSTRAINTS SUMMARY ===")
 
+    # ── Setează obiectivul ───────────────────────────────────────────────────
+    if objective:
+        model.minimize(sum(objective))
+        logger.info(f"  model.minimize: {len(objective)} terms")
+    else:
+        logger.info("  No objective — pure feasibility")
+
     # ── Model stats ──────────────────────────────────────────────────────────
     proto = model.proto
     logger.info(f"  Model: {len(proto.variables)} vars, {len(proto.constraints)} constraints")
