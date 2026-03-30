@@ -287,7 +287,7 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     objective = []
     w = cfg.weights
     active = []
-    logger.info(f"  cfg: avoidGaps={cfg.avoidGapsForTeachers} startFirst={cfg.startFromFirstSlot} "                f"lastHour={cfg.avoidLastHourForStages} sameSubj={cfg.avoidSameSubjectTwicePerDay}")
+    logger.info(f"  cfg: avoidGaps={cfg.avoidGapsForTeachers} startFirst={cfg.startFromFirstSlot} lastHour={cfg.avoidLastHourForStages} sameSubj={cfg.avoidSameSubjectTwicePerDay}")
     logger.info(f"  weights: {w}")
 
     # 1. Evită ultima oră pentru clase mici
