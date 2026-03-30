@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 
 from solvers.shifts import solve_shifts, ShiftsRequest, ShiftsResponse
-from solvers.school_bug import solve_school, SchoolRequest, SchoolResponse
+from solvers.school import solve_school, SchoolRequest, SchoolResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -64,9 +64,10 @@ async def solve_school_endpoint(payload: SchoolRequest) -> SchoolResponse:
     Output: timetable (class × subject × day × period) + violations + debug_log.
     """
     logger.info(
-        f"Solving school timetable: {len(payload.lessons)} lessons, "
-        f"{len(payload.classes)} classes, "
-        f"{payload.slots_per_day} slots/day"
+        f"Solving school timetable: {len(payload.class_ids)} classes, "
+        f"{len(payload.subject_ids)} subjects, "
+        f"{len(payload.class_subjects)} assignments, "
+        f"{payload.periods_per_day} periods/day"
     )
     try:
         return solve_school(payload)
