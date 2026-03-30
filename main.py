@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 
 from solvers.shifts import solve_shifts, ShiftsRequest, ShiftsResponse
-from solvers.school import solve_school, SchoolRequest, SchoolResponse
+from solvers.school_bug import solve_school, SchoolRequest, SchoolResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
