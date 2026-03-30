@@ -333,22 +333,97 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                 if slot not in preferred_set:
                     objective.append(var * 5)
 
-    # 4. Penalizare sloturi târzii (teacher gaps + startFromFirstSlot combinate)
-    slot_weight = 0
-    if cfg.avoidGapsForTeachers and w.get('teacherGaps', 0) > 0:
-        slot_weight = max(slot_weight, w['teacherGaps'])
-        active.append(f"teacherGaps(w={w['teacherGaps']})")
+    # 4. startFromFirstSlot — penalizare exponențială pentru sloturi târzii per clasă
     if cfg.startFromFirstSlot and w.get('startFirst', 0) > 0:
-        slot_weight = max(slot_weight, w['startFirst'])
-        active.append(f"startFirst(w={w['startFirst']})")
-    if slot_weight > 0:
-        for lesson in payload.lessons:
-            for slot, var in x[lesson.id].items():
-                p = parse_slot(slot)[1]
-                if p > 0:
-                    objective.append(var * p * (slot_weight // 20))
+        weight = w['startFirst']
+        active.append(f"startFirst(w={weight})")
+        for class_id, cls_lessons in class_lessons.items():
+            for d in range(D):
+                for p in range(P):
+                    slot = f"{d}-{p}"
+                    slot_vars = [x[l.id][slot] for l in cls_lessons if slot in x[l.id]]
+                    for v in slot_vars:
+                        # Penalizare pătrată — slot 0=0, slot 1=w, slot 2=4w, slot 5=25w
+                        objective.append(v * p * p * weight)
+
+    # 5. Teacher gaps — penalizare pentru ferestre între lecțiile aceluiași profesor
+    if cfg.avoidGapsForTeachers and w.get('teacherGaps', 0) > 0:
+        weight = w['teacherGaps']
+        active.append(f"teacherGaps(w={weight})")
+        for teacher_id, t_lessons in teacher_lessons.items():
+            for d in range(D):
+                # Penalizăm sloturi târzii per profesor — preferă să fie compact dimineața
+                for p in range(P):
+                    slot = f"{d}-{p}"
+                    slot_vars = [x[l.id][slot] for l in t_lessons if slot in x[l.id]]
+                    for v in slot_vars:
+                        objective.append(v * p * p * weight)
 
     logger.info(f"  Soft constraints active: {active if active else 'none'}")
+    logger.info(f"  Objective terms: {len(objective)}")
+
+    # ── Log toate constrângerile (hard + soft) cu parametrii ─────────────────
+    logger.info("  === CONSTRAINTS SUMMARY ===")
+
+    # HARD constraints — întotdeauna active
+    logger.info("  [HARD] noTeacherOverlap: teacher max 1 lecție/slot")
+    logger.info("  [HARD] noClassOverlap: clasă max 1 lecție/slot")
+    logger.info(f"  [HARD] lessonPlacedOnce: fiecare din {len(payload.lessons)} lecții plasată exact 1 dată")
+    logger.info(f"  [HARD] allowedSlotsOnly: lecțiile plasate doar în allowed_slots")
+
+    # HARD din resurse
+    for t in payload.teachers:
+        if t.max_lessons_per_day:
+            logger.info(f"  [HARD] {t.name}: max {t.max_lessons_per_day} ore/zi")
+        if t.max_lessons_per_week:
+            logger.info(f"  [HARD] {t.name}: max {t.max_lessons_per_week} ore/săpt")
+        if t.min_lessons_per_week:
+            logger.info(f"  [HARD] {t.name}: min {t.min_lessons_per_week} ore/săpt (normă)")
+        unavail = len([s for l in teacher_lessons.get(t.id, []) for s in [] ]) # computed via allowed_slots
+        logger.info(f"  [HARD] {t.name}: {30 - len(set(s for l in teacher_lessons.get(t.id,[]) for s in l.allowed_slots)) if teacher_lessons.get(t.id) else 0} sloturi indisponibile")
+    for c in payload.classes:
+        logger.info(f"  [HARD] {c.name}: max {c.max_lessons_per_day} ore/zi")
+
+    # SOFT constraints
+    if cfg.avoidLastHourForStages and w.get('lastHour', 0) > 0:
+        stages = cfg.avoidLastHourForStages if isinstance(cfg.avoidLastHourForStages, list) else ['primary','middle']
+        terms = sum(1 for lesson in payload.lessons
+                    for d in range(D) if f"{d}-{P-1}" in x[lesson.id]
+                    and lesson.class_id in {c.id for c in payload.classes if c.stage in stages})
+        logger.info(f"  [SOFT] avoidLastHour: w={w['lastHour']}, {terms} vars, max penalty={terms * w['lastHour']}")
+    else:
+        logger.info(f"  [SOFT] avoidLastHour: DEZACTIVAT")
+
+    if cfg.avoidSameSubjectTwicePerDay and w.get('sameSubject', 0) > 0:
+        logger.info(f"  [SOFT] sameSubjectTwicePerDay: w={w['sameSubject']}, penalizare per oră extra/zi")
+    else:
+        logger.info(f"  [SOFT] sameSubjectTwicePerDay: DEZACTIVAT")
+
+    if cfg.startFromFirstSlot and w.get('startFirst', 0) > 0:
+        terms = sum(1 for l in payload.lessons for s in x[l.id] if parse_slot(s)[1] > 0)
+        logger.info(f"  [SOFT] startFromFirstSlot: w={w['startFirst']}, {terms} vars, penalizare slot^2 × w")
+    else:
+        logger.info(f"  [SOFT] startFromFirstSlot: DEZACTIVAT")
+
+    if cfg.avoidGapsForTeachers and w.get('teacherGaps', 0) > 0:
+        terms = sum(1 for t_lessons in teacher_lessons.values()
+                    for l in t_lessons for s in x[l.id] if parse_slot(s)[1] > 0)
+        logger.info(f"  [SOFT] avoidGapsTeachers: w={w['teacherGaps']}, {terms} vars, penalizare slot^2 × w")
+    else:
+        logger.info(f"  [SOFT] avoidGapsTeachers: DEZACTIVAT")
+
+    if cfg.hardSubjectsMorning and w.get('hardMorning', 0) > 0:
+        logger.info(f"  [SOFT] hardSubjectsMorning: w={w['hardMorning']} (neimplementat încă — în development)")
+    else:
+        logger.info(f"  [SOFT] hardSubjectsMorning: DEZACTIVAT")
+
+    # Preferred slots per profesor
+    for t in payload.teachers:
+        if t.preferred_slots:
+            logger.info(f"  [SOFT] {t.name} preferred slots: {len(t.preferred_slots)} sloturi, penalizare w=5 dacă nu respectat")
+
+    logger.info(f"  Total objective terms: {len(objective)}")
+    logger.info("  === END CONSTRAINTS SUMMARY ===")
 
     # ── Model stats ──────────────────────────────────────────────────────────
     proto = model.proto
@@ -539,6 +614,27 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
         "scheduled":  len(timetable),
         "violations": len(violations),
     })
+    # ── Score breakdown din soluție ──────────────────────────────────────────
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) and obj_val is not None:
+        logger.info(f"  Objective value: {obj_val:.0f}")
+        # Per-slot distribution
+        slot_dist: dict[int, int] = defaultdict(int)
+        for lesson in timetable:
+            slot_dist[lesson.period] += 1
+        dist_str = ' '.join(f"S{p+1}:{cnt}" for p, cnt in sorted(slot_dist.items()))
+        logger.info(f"  Slot distribution: {dist_str}")
+        # Per-teacher first slot
+        teacher_first: dict[str, list] = defaultdict(list)
+        for lesson in timetable:
+            teacher_first[lesson.teacher_id].append((lesson.day, lesson.period))
+        for tid, slots in teacher_first.items():
+            tname = next((t.name for t in payload.teachers if t.id == tid), tid[:8])
+            by_day = defaultdict(list)
+            for d, p in slots: by_day[d].append(p)
+            first_slots = {d: min(ps) for d, ps in by_day.items()}
+            avg_first = sum(first_slots.values()) / len(first_slots) if first_slots else 0
+            logger.info(f"  [RESULT] {tname}: avg first slot/zi = {avg_first:.1f} (0=prima ora)")
+
     logger.info(f"=== Done: {len(timetable)}/{total} lessons, {len(violations)} violations ===")
 
     return SchoolResponse(
