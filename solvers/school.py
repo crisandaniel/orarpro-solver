@@ -287,6 +287,8 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     objective = []
     w = cfg.weights
     active = []
+    logger.info(f"  cfg: avoidGaps={cfg.avoidGapsForTeachers} startFirst={cfg.startFromFirstSlot} "                f"lastHour={cfg.avoidLastHourForStages} sameSubj={cfg.avoidSameSubjectTwicePerDay}")
+    logger.info(f"  weights: {w}")
 
     # 1. Evită ultima oră pentru clase mici
     if cfg.avoidLastHourForStages and w.get('lastHour', 0) > 0:
@@ -317,9 +319,10 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
                     continue
                 count_v  = model.new_int_var(0, len(day_vars), f"sc_{subj_id[:6]}_{class_id[:6]}_d{d}")
                 model.add(count_v == sum(day_vars))
+                # excess = max(0, count - 1): penalizăm fiecare oră suplimentară din aceeași materie/zi
                 excess_v = model.new_int_var(0, len(day_vars), f"ex_{subj_id[:6]}_{class_id[:6]}_d{d}")
-                zero_c   = model.new_constant(0)
-                model.add_max_equality(excess_v, [count_v - 1, zero_c])
+                model.add(excess_v >= count_v - 1)
+                model.add(excess_v >= 0)
                 objective.append(excess_v * weight)
         active.append(f"sameSubject(w={weight})")
 
@@ -337,6 +340,7 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
     if cfg.startFromFirstSlot and w.get('startFirst', 0) > 0:
         weight = w['startFirst']
         active.append(f"startFirst(w={weight})")
+        logger.info(f"  startFromFirstSlot ACTIVE: w={weight}")
         for class_id, cls_lessons in class_lessons.items():
             for d in range(D):
                 for p in range(P):
