@@ -346,7 +346,7 @@ def solve_school(payload: SchoolRequest) -> SchoolResponse:
             for slot, var in x[lesson.id].items():
                 p = parse_slot(slot)[1]
                 if p > 0:
-                    objective.append(var * p * slot_weight // 20)
+                    objective.append(var * ((p * slot_weight) // 20))
 
     logger.info(f"  Soft constraints active: {active if active else 'none'}")
 
