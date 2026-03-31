@@ -73,3 +73,51 @@ async def solve_school_endpoint(payload: SchoolRequest) -> SchoolResponse:
     except Exception as e:
         logger.error(f"School solver error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+from solvers.business import solve_business
+
+# 2. Pydantic models (adaugă în main.py lângă celelalte modele):
+from pydantic import BaseModel
+from typing import Optional, Any
+
+class HardConfig(BaseModel):
+    min_employees_per_shift: int = 2
+    max_consecutive_days: int = 6
+    min_rest_hours: float = 11.0
+    max_weekly_hours: float = 48.0
+    max_night_shifts_per_week: int = 2
+    enforce_legal_limits: bool = True
+
+class SoftWeights(BaseModel):
+    balance: int = 90
+    nightWeekend: int = 70
+    preferences: int = 80
+    daysOff: int = 75
+    continuity: int = 40
+
+class BusinessSoftRules(BaseModel):
+    balanceHours: bool = True
+    avoidNightWeekend: bool = True
+    respectPreferences: bool = True
+    consecutiveDaysOff: bool = True
+    shiftContinuity: bool = False
+    weights: SoftWeights = SoftWeights()
+
+class BusinessSolveRequest(BaseModel):
+    schedule: dict[str, Any]
+    employees: list[dict[str, Any]]
+    shift_definitions: list[dict[str, Any]]
+    leaves: list[dict[str, Any]] = []
+    hard_config: HardConfig = HardConfig()
+    soft_rules: BusinessSoftRules = BusinessSoftRules()
+    solver_time_limit_seconds: int = 50
+
+# 3. Route (adaugă în main.py):
+@app.post("/solve/business")
+async def solve_business_route(req: BusinessSolveRequest):
+    try:
+        result = solve_business(req.model_dump())
+        return result
+    except Exception as e:
+        logger.exception("Business solver error")
+        raise HTTPException(status_code=500, detail=str(e))
