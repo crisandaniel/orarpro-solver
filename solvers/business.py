@@ -681,15 +681,27 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
         log("  ✓ Niciun conflict angajat/zi detectat")
 
     emp_counts: dict[str,int] = Counter(a.employee_id for a in assignments)
+    # Per-employee dates per shift — echivalentul sloturi din school
+    emp_shift_dates: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    for a in assignments:
+        emp_shift_dates[a.employee_id][a.shift_definition_id].append(a.date)
+
     log("  Distribuție ture/angajat:")
     for emp in payload.employees:
         cnt = emp_counts.get(emp.id, 0)
-        log(f"    {emp.name}: {cnt} ture asignate")
+        # Format similar cu school: "ShiftName: [date1, date2, ...]"
+        shift_summary = []
+        for shift in payload.shift_definitions:
+            dates = emp_shift_dates[emp.id].get(shift.id, [])
+            if dates:
+                shift_summary.append(f"{shift.name}:{len(dates)}z")
+        log(f"  [RESULT] {emp.name}: {cnt} ture → {', '.join(shift_summary) if shift_summary else 'nicio tură'}")
         debug_log.append({
             "type":        "employee_result",
             "employee_id": emp.id,
             "name":        emp.name,
             "assignments": cnt,
+            "by_shift":    {s.id: len(emp_shift_dates[emp.id].get(s.id, [])) for s in payload.shift_definitions},
         })
 
     debug_log.append({"type": "distribution", "data": dict(emp_counts)})
