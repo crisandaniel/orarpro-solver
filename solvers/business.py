@@ -138,11 +138,17 @@ class ShiftsResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def parse_hhmm(t: str) -> tuple[int, int]:
+    """Parsează HH:MM sau HH:MM:SS → (hour, minute). Ignoră secundele."""
+    parts = t.split(":")
+    return int(parts[0]), int(parts[1])
+
+
 def shift_duration_hours(shift: ShiftDefinition) -> float:
     if shift.duration_hours is not None:
         return shift.duration_hours
-    sh, sm = map(int, shift.start_time.split(':'))
-    eh, em = map(int, shift.end_time.split(':'))
+    sh, sm = parse_hhmm(shift.start_time)
+    eh, em = parse_hhmm(shift.end_time)
     start_mins = sh * 60 + sm
     end_mins   = eh * 60 + em
     if shift.crosses_midnight:
@@ -152,11 +158,11 @@ def shift_duration_hours(shift: ShiftDefinition) -> float:
 
 def rest_hours_between(shift_a: ShiftDefinition, shift_b: ShiftDefinition) -> float:
     """Ore de repaus dacă shift_a se termină și shift_b începe a doua zi."""
-    eh, em       = map(int, shift_a.end_time.split(':'))
+    eh, em       = parse_hhmm(shift_a.end_time)
     end_mins_a   = eh * 60 + em
     if shift_a.crosses_midnight:
         end_mins_a += 24 * 60
-    bh, bm         = map(int, shift_b.start_time.split(':'))
+    bh, bm         = parse_hhmm(shift_b.start_time)
     start_mins_b   = bh * 60 + bm + 24 * 60   # a doua zi
     rest = (start_mins_b - end_mins_a) / 60.0
     if rest < 0:
