@@ -1,32 +1,17 @@
 # orarpro-solver/solvers/business.py  (v2)
+# Endpoint: POST /solve/business
 #
-# Solver CP-SAT pentru orare business (ture fixe — horeca, fabrici, retail, clinici).
-# Endpoint: POST /solve/shifts  (neschimbat față de versiunea anterioară)
-#
-# Input model (compatibil cu payload-ul existent din generate/route.ts):
-#   employees:         angajați cu disponibilitate
-#   shift_definitions: ture cu start/end/crosses_midnight/slots_per_day
-#   working_dates:     liste date pre-calculate de Next.js
-#   slots_per_shift:   dict shiftId → slots/zi (legacy, override shifts.slots_per_day)
-#   leaves:            concedii
-#   unavailability:    indisponibilități (zi_săptămână sau dată specifică)
-#   config:            hard constraints
-#   soft_rules:        soft constraints cu weights (nou — opțional)
-#
-# HARD constraints:
-#   1. Max 1 tură per angajat per zi
-#   2. Angajat indisponibil / concediu → nu e asignat
-#   3. Min repaus între ture consecutive (min_rest_hours_between_shifts)
-#   4. Max zile consecutive (max_consecutive_days)
-#   5. Max ore/săptămână (max_weekly_hours)
-#   6. Max ture de noapte/săptămână
-#   7. pair_forbidden (din constraints legacy)
-#
-# SOFT constraints (objective):
-#   - balanceHours:       distribuție egală ture între angajați
-#   - avoidNightWeekend:  evită ture noapte vineri/sâmbătă
-#   - shiftContinuity:    minimizează schimbările de tură
-#   - consecutiveDaysOff: penalizare zile libere izolate
+# Loguri structurate identic cu school.py:
+#   === Business solver v2 ===
+#   ANGAJAT / TURĂ info (echivalent TEACHER / CLASS din school)
+#   [CHECk] disponibilitate per angajat
+#   [HARD1..7] constrângeri hard cu număr constrângeri
+#   === CONSTRAINTS SUMMARY ===
+#   [SOFT1..4] cu termeni și weights
+#   === PRE-SOLVE CHECK ===
+#   === POST-SOLVE VALIDATION ===
+#   [RESULT] per angajat: X ture → TurăA:Nz, TurăB:Mz
+#   === Done ===
 
 from __future__ import annotations
 from ortools.sat.python import cp_model
@@ -52,11 +37,11 @@ class EmployeeConfig(BaseModel):
 class ShiftDefinition(BaseModel):
     id: str
     name: str
-    shift_type: str = 'custom'            # morning/afternoon/night/custom
-    start_time: str                       # "HH:MM"
-    end_time: str                         # "HH:MM"
+    shift_type: str = 'custom'
+    start_time: str
+    end_time: str
     crosses_midnight: bool = False
-    slots_per_day: int = 1                # angajați necesari/zi
+    slots_per_day: int = 1
     duration_hours: Optional[float] = None
 
 class LeaveEntry(BaseModel):
@@ -66,8 +51,8 @@ class LeaveEntry(BaseModel):
 
 class UnavailabilityEntry(BaseModel):
     employee_id: str
-    date: Optional[str] = None            # "yyyy-mm-dd"
-    day_of_week: Optional[int] = None     # ISO 1=Mon..7=Sun
+    date: Optional[str] = None
+    day_of_week: Optional[int] = None
 
 class SoftRules(BaseModel):
     balanceHours: bool = True
@@ -76,11 +61,8 @@ class SoftRules(BaseModel):
     consecutiveDaysOff: bool = True
     shiftContinuity: bool = False
     weights: dict = {
-        'balance': 90,
-        'nightWeekend': 70,
-        'preferences': 80,
-        'daysOff': 75,
-        'continuity': 40,
+        'balance': 90, 'nightWeekend': 70,
+        'preferences': 80, 'daysOff': 75, 'continuity': 40,
     }
 
 class ShiftsConfig(BaseModel):
@@ -98,8 +80,8 @@ class ShiftsRequest(BaseModel):
     employees: list[EmployeeConfig] = []
     shift_definitions: list[ShiftDefinition] = []
     working_dates: list[str] = []
-    slots_per_shift: dict[str, int] = {}  # legacy: shiftId → slots/zi
-    constraints: list[dict] = []          # pair_required/pair_forbidden (legacy)
+    slots_per_shift: dict[str, int] = {}   # legacy override
+    constraints: list[dict] = []           # pair_required/pair_forbidden legacy
     leaves: list[LeaveEntry] = []
     unavailability: list[UnavailabilityEntry] = []
     config: ShiftsConfig = ShiftsConfig()
@@ -139,8 +121,8 @@ class ShiftsResponse(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def parse_hhmm(t: str) -> tuple[int, int]:
-    """Parsează HH:MM sau HH:MM:SS → (hour, minute). Ignoră secundele."""
-    parts = t.split(":")
+    """Parsează HH:MM sau HH:MM:SS → (hour, minute)."""
+    parts = t.split(':')
     return int(parts[0]), int(parts[1])
 
 
@@ -163,7 +145,7 @@ def rest_hours_between(shift_a: ShiftDefinition, shift_b: ShiftDefinition) -> fl
     if shift_a.crosses_midnight:
         end_mins_a += 24 * 60
     bh, bm         = parse_hhmm(shift_b.start_time)
-    start_mins_b   = bh * 60 + bm + 24 * 60   # a doua zi
+    start_mins_b   = bh * 60 + bm + 24 * 60
     rest = (start_mins_b - end_mins_a) / 60.0
     if rest < 0:
         rest += 24.0
@@ -179,14 +161,15 @@ def get_week_key(d: date) -> str:
 
 def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
     debug_log: list[dict] = []
-    cfg   = payload.config
-    soft  = payload.soft_rules
+    cfg     = payload.config
+    soft    = payload.soft_rules
     weights = soft.weights
 
+    # ── identic cu school: prima linie de log ─────────────────────────────────
     logger.info("=== Business solver v2 ===")
     logger.info(f"  {len(payload.employees)} angajați, "
                 f"{len(payload.shift_definitions)} ture, "
-                f"{len(payload.working_dates)} zile de lucru")
+                f"{len(payload.working_dates)} zile")
 
     def log(msg: str, level: str = "info"):
         debug_log.append({"type": "log", "level": level, "message": msg})
@@ -201,14 +184,13 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
         max_consecutive = cfg.max_consecutive_days
         min_rest        = cfg.min_rest_hours_between_shifts
         max_weekly_h    = cfg.max_weekly_hours
-
     max_night = cfg.max_night_shifts_per_week
 
     log(f"Config: max_consecutive={max_consecutive}, min_rest={min_rest}h, "
         f"max_weekly={max_weekly_h}h, max_night/săpt={max_night}, "
         f"legal_UE={'DA' if cfg.enforce_legal_limits else 'NU'}")
 
-    # ── Parse working dates ───────────────────────────────────────────────────
+    # ── Parse dates ───────────────────────────────────────────────────────────
     working_dates: list[date] = []
     for ds in payload.working_dates:
         try:
@@ -222,30 +204,28 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
 
     log(f"Date: {n_dates}, Angajați: {n_employees}, Ture: {n_shifts}")
 
-    # ── Effective slots per shift (legacy override) ───────────────────────────
+    # ── Effective slots (legacy merge) ────────────────────────────────────────
     effective_slots: dict[str, int] = {}
     for shift in payload.shift_definitions:
         legacy = payload.slots_per_shift.get(shift.id)
         effective_slots[shift.id] = legacy if legacy is not None else shift.slots_per_day
 
-    # ── Log employees ─────────────────────────────────────────────────────────
+    # ── Log angajați — identic cu school log teachers ─────────────────────────
     for e in payload.employees:
         log(f"  ANGAJAT {e.name}: unavail_days={e.unavailable_days}, "
-            f"unavail_dates={len(e.unavailable_dates)} date specifice")
+            f"unavail_dates={len(e.unavailable_dates)} date")
 
-    # ── Log shift definitions ─────────────────────────────────────────────────
+    # ── Log ture — identic cu school log classes ──────────────────────────────
     for s in payload.shift_definitions:
         dur = shift_duration_hours(s)
         log(f"  TURĂ {s.name}: {s.start_time}–{s.end_time} "
             f"({'trece miezul nopții' if s.crosses_midnight else 'normală'}) "
             f"{dur:.1f}h, tip={s.shift_type}, slots={effective_slots[s.id]}/zi")
         debug_log.append({
-            "type":          "shift_info",
-            "shift_id":      s.id,
-            "name":          s.name,
-            "duration_h":    dur,
-            "slots_per_day": effective_slots[s.id],
-            "shift_type":    s.shift_type,
+            "type": "shift_info", "shift_id": s.id, "name": s.name,
+            "start_time": s.start_time, "end_time": s.end_time,
+            "duration_h": dur, "slots_per_day": effective_slots[s.id],
+            "shift_type": s.shift_type,
         })
 
     if n_dates == 0 or n_employees == 0 or n_shifts == 0:
@@ -257,8 +237,8 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
             debug_log=debug_log,
         )
 
-    # ── Build availability ────────────────────────────────────────────────────
-    leave_set: set[tuple[str,str]] = set()
+    # ── Availability ──────────────────────────────────────────────────────────
+    leave_set: set[tuple[str, str]] = set()
     for leave in payload.leaves:
         s = date.fromisoformat(leave.start_date)
         e = date.fromisoformat(leave.end_date)
@@ -267,7 +247,7 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
             leave_set.add((leave.employee_id, cur.isoformat()))
             cur += timedelta(days=1)
 
-    unavail_dates_set: set[tuple[str,str]] = set()
+    unavail_dates_set: set[tuple[str, str]] = set()
     unavail_days_map: dict[str, set[int]] = defaultdict(set)
     for u in payload.unavailability:
         if u.date:
@@ -278,76 +258,61 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
     def is_available(emp: EmployeeConfig, d: date) -> bool:
         d_str  = d.isoformat()
         iso_wd = d.isoweekday()
-        if (emp.id, d_str) in leave_set:
-            return False
-        if iso_wd in (emp.unavailable_days or []):
-            return False
-        if d_str in (emp.unavailable_dates or []):
-            return False
-        if (emp.id, d_str) in unavail_dates_set:
-            return False
-        if iso_wd in unavail_days_map.get(emp.id, set()):
-            return False
+        if (emp.id, d_str) in leave_set:             return False
+        if iso_wd in (emp.unavailable_days or []):   return False
+        if d_str in (emp.unavailable_dates or []):   return False
+        if (emp.id, d_str) in unavail_dates_set:     return False
+        if iso_wd in unavail_days_map.get(emp.id, set()): return False
         return True
 
-    # ── CP-SAT Model ──────────────────────────────────────────────────────────
+    # ── Variables ─────────────────────────────────────────────────────────────
     model = cp_model.CpModel()
-
-    x: dict[tuple[int,int,int], cp_model.IntVar] = {}
+    x: dict[tuple[int, int, int], cp_model.IntVar] = {}
     for e_idx, emp in enumerate(payload.employees):
         for d_idx, d in enumerate(working_dates):
             for s_idx, shift in enumerate(payload.shift_definitions):
                 if is_available(emp, d):
-                    x[e_idx, d_idx, s_idx] = model.new_bool_var(
-                        f"x_{e_idx}_{d_idx}_{s_idx}"
-                    )
+                    x[e_idx, d_idx, s_idx] = model.new_bool_var(f"x_{e_idx}_{d_idx}_{s_idx}")
 
     total_vars = len(x)
     log(f"Variabile create: {total_vars}")
     debug_log.append({"type": "variables", "count": total_vars})
 
+    # ── Log disponibilitate — identic cu school log assignments ───────────────
     for e_idx, emp in enumerate(payload.employees):
-        avail = sum(1 for d_idx in range(n_dates)
-                    for s_idx in range(n_shifts)
+        avail = sum(1 for d_idx in range(n_dates) for s_idx in range(n_shifts)
                     if (e_idx, d_idx, s_idx) in x)
         ok = avail >= n_shifts
         log(f"  [CHECK] {emp.name}: {avail} sloturi disponibile din "
             f"{n_dates * n_shifts} maxime "
-            f"({'✓ OK' if ok else '⚠ puține sloturi'})")
+            f"({'✓ OK' if ok else '✗ IMPOSIBIL — nicio disponibilitate'})")
         debug_log.append({
-            "type":            "employee_check",
-            "employee_id":     emp.id,
-            "name":            emp.name,
-            "available_slots": avail,
-            "max_slots":       n_dates * n_shifts,
+            "type": "employee_check", "employee_id": emp.id, "name": emp.name,
+            "available_slots": avail, "max_slots": n_dates * n_shifts,
         })
 
     # ── HARD 1: Max 1 tură/angajat/zi ────────────────────────────────────────
     for e_idx in range(n_employees):
         for d_idx in range(n_dates):
-            day_vars = [x[e_idx, d_idx, s_idx]
-                        for s_idx in range(n_shifts)
+            day_vars = [x[e_idx, d_idx, s_idx] for s_idx in range(n_shifts)
                         if (e_idx, d_idx, s_idx) in x]
             if len(day_vars) > 1:
                 model.add(sum(day_vars) <= 1)
-
     log("[HARD1] max 1 tură/angajat/zi — aplicat")
 
-    # ── HARD 2: Acoperire minimă (soft-penalty — evită INFEASIBLE) ────────────
+    # ── HARD 2: Acoperire minimă (soft-penalty) ───────────────────────────────
     coverage_penalties: list[cp_model.IntVar] = []
     for d_idx in range(n_dates):
         for s_idx, shift in enumerate(payload.shift_definitions):
             slots = effective_slots[shift.id]
-            assigned = [x[e_idx, d_idx, s_idx]
-                        for e_idx in range(n_employees)
+            assigned = [x[e_idx, d_idx, s_idx] for e_idx in range(n_employees)
                         if (e_idx, d_idx, s_idx) in x]
             if not assigned:
                 continue
             shortage = model.new_int_var(0, slots, f"shortage_{d_idx}_{s_idx}")
             model.add(shortage >= slots - sum(assigned))
             coverage_penalties.append(shortage)
-
-    log(f"[HARD2] acoperire: {len(coverage_penalties)} perechi tură/zi monitorizate")
+    log(f"[HARD2] acoperire minimă: {len(coverage_penalties)} perechi tură/zi")
 
     # ── HARD 3: Min repaus între ture consecutive ─────────────────────────────
     rest_cnt = 0
@@ -357,20 +322,16 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
             d_next  = working_dates[d_idx + 1]
             if (d_next - d_today).days != 1:
                 continue
-            for s_today_idx, shift_today in enumerate(payload.shift_definitions):
-                if (e_idx, d_idx, s_today_idx) not in x:
+            for s_a, shift_a in enumerate(payload.shift_definitions):
+                if (e_idx, d_idx, s_a) not in x:
                     continue
-                for s_next_idx, shift_next in enumerate(payload.shift_definitions):
-                    if (e_idx, d_idx + 1, s_next_idx) not in x:
+                for s_b, shift_b in enumerate(payload.shift_definitions):
+                    if (e_idx, d_idx + 1, s_b) not in x:
                         continue
-                    rest = rest_hours_between(shift_today, shift_next)
-                    if rest < min_rest:
-                        model.add_bool_or([
-                            x[e_idx, d_idx, s_today_idx].negated(),
-                            x[e_idx, d_idx + 1, s_next_idx].negated(),
-                        ])
+                    if rest_hours_between(shift_a, shift_b) < min_rest:
+                        model.add_bool_or([x[e_idx, d_idx, s_a].negated(),
+                                           x[e_idx, d_idx + 1, s_b].negated()])
                         rest_cnt += 1
-
     log(f"[HARD3] min repaus {min_rest}h: {rest_cnt} constrângeri")
 
     # ── HARD 4: Max zile consecutive ─────────────────────────────────────────
@@ -380,44 +341,32 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
             for d_start in range(n_dates - max_consecutive):
                 window = []
                 for d_idx in range(d_start, d_start + max_consecutive + 1):
-                    day_vars = [x[e_idx, d_idx, s_idx]
-                                for s_idx in range(n_shifts)
+                    day_vars = [x[e_idx, d_idx, s_idx] for s_idx in range(n_shifts)
                                 if (e_idx, d_idx, s_idx) in x]
                     if day_vars:
-                        worked = model.new_bool_var(
-                            f"worked_{e_idx}_{d_idx}_{d_start}"
-                        )
+                        worked = model.new_bool_var(f"worked_{e_idx}_{d_idx}_{d_start}")
                         model.add_bool_or(day_vars + [worked.negated()])
-                        for v in day_vars:
-                            model.add(worked >= v)
+                        for v in day_vars: model.add(worked >= v)
                         window.append(worked)
                 if len(window) == max_consecutive + 1:
                     model.add(sum(window) <= max_consecutive)
                     consec_cnt += 1
-
     log(f"[HARD4] max {max_consecutive} zile consecutive: {consec_cnt} ferestre")
 
     # ── HARD 5: Max ore/săptămână ─────────────────────────────────────────────
     weeks: dict[str, list[int]] = {}
     for d_idx, d in enumerate(working_dates):
-        wk = get_week_key(d)
-        weeks.setdefault(wk, []).append(d_idx)
-
+        weeks.setdefault(get_week_key(d), []).append(d_idx)
     weekly_cnt = 0
     for e_idx in range(n_employees):
         for wk, d_indices in weeks.items():
-            terms = []
-            for d_idx in d_indices:
-                for s_idx, shift in enumerate(payload.shift_definitions):
-                    if (e_idx, d_idx, s_idx) in x:
-                        dur_int = int(shift_duration_hours(shift) * 10)
-                        terms.append((dur_int, x[e_idx, d_idx, s_idx]))
+            terms = [(int(shift_duration_hours(payload.shift_definitions[s_idx]) * 10),
+                      x[e_idx, d_idx, s_idx])
+                     for d_idx in d_indices for s_idx in range(n_shifts)
+                     if (e_idx, d_idx, s_idx) in x]
             if terms:
-                model.add(
-                    sum(d * v for d, v in terms) <= int(max_weekly_h * 10)
-                )
+                model.add(sum(d * v for d, v in terms) <= int(max_weekly_h * 10))
                 weekly_cnt += 1
-
     log(f"[HARD5] max {max_weekly_h}h/săpt: {weekly_cnt} constrângeri")
 
     # ── HARD 6: Max ture noapte/săptămână ────────────────────────────────────
@@ -428,35 +377,29 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
         for e_idx in range(n_employees):
             for wk, d_indices in weeks.items():
                 night_vars = [x[e_idx, d_idx, s_idx]
-                              for d_idx in d_indices
-                              for s_idx in night_indices
+                              for d_idx in d_indices for s_idx in night_indices
                               if (e_idx, d_idx, s_idx) in x]
                 if night_vars:
                     model.add(sum(night_vars) <= max_night)
                     night_cnt += 1
-
     log(f"[HARD6] max {max_night} ture noapte/săpt: {night_cnt} constrângeri")
 
-    # ── HARD 7: pair_forbidden (legacy constraints) ───────────────────────────
+    # ── HARD 7: pair_forbidden (legacy) ──────────────────────────────────────
     emp_idx_map = {e.id: i for i, e in enumerate(payload.employees)}
     pair_forb = [c for c in payload.constraints
                  if c.get('type') == 'pair_forbidden' and c.get('is_active', True)]
     for c in pair_forb:
         ea = emp_idx_map.get(c.get('employee_id', ''))
         eb = emp_idx_map.get(c.get('target_employee_id', ''))
-        if ea is None or eb is None:
-            continue
+        if ea is None or eb is None: continue
         for d_idx in range(n_dates):
             for s_idx in range(n_shifts):
-                va = x.get((ea, d_idx, s_idx))
-                vb = x.get((eb, d_idx, s_idx))
-                if va and vb:
-                    model.add_bool_or([va.negated(), vb.negated()])
-
+                va, vb = x.get((ea, d_idx, s_idx)), x.get((eb, d_idx, s_idx))
+                if va and vb: model.add_bool_or([va.negated(), vb.negated()])
     if pair_forb:
         log(f"[HARD7] pair_forbidden: {len(pair_forb)} perechi interzise")
 
-    # ── Log constraints summary ───────────────────────────────────────────────
+    # ── Constraints summary — identic cu school ───────────────────────────────
     log("=== CONSTRAINTS SUMMARY ===")
     log(f"  [HARD] max1TurăPeZi: fiecare angajat max 1 tură/zi")
     log(f"  [HARD] repausMinim: {min_rest}h → {rest_cnt} constrângeri")
@@ -464,8 +407,10 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
     log(f"  [HARD] oreSăptămână: max {max_weekly_h}h → {weekly_cnt} constrângeri")
     log(f"  [HARD] turăNoapte: max {max_night}/săpt → {night_cnt} constrângeri")
     log(f"  [HARD] acoperire: soft-penalty w=500 → {len(coverage_penalties)} variabile")
-    if pair_forb:
-        log(f"  [HARD] pairForbidden: {len(pair_forb)} perechi")
+    for t in payload.employees:
+        avail_cnt = sum(1 for d_idx in range(n_dates) for s_idx in range(n_shifts)
+                        if (payload.employees.index(t), d_idx, s_idx) in x)
+        log(f"  [HARD] {t.name}: {avail_cnt} sloturi disponibile")
 
     # ── SOFT objective ────────────────────────────────────────────────────────
     objective: list = []
@@ -476,32 +421,30 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
     w_continuity = weights.get('continuity', 40) if soft.shiftContinuity   else 0
     w_days_off   = weights.get('daysOff', 75)    if soft.consecutiveDaysOff else 0
 
-    # SOFT1: Distribuție egală ture ───────────────────────────────────────────
+    # SOFT1: Distribuție egală ─────────────────────────────────────────────────
     if w_balance > 0:
-        shift_totals = []
+        totals = []
         for e_idx in range(n_employees):
             emp_vars = [x[e_idx, d_idx, s_idx]
-                        for d_idx in range(n_dates)
-                        for s_idx in range(n_shifts)
+                        for d_idx in range(n_dates) for s_idx in range(n_shifts)
                         if (e_idx, d_idx, s_idx) in x]
-            if emp_vars:
-                shift_totals.append(sum(emp_vars))
-
-        if len(shift_totals) > 1:
-            avg_target = model.new_int_var(0, n_dates * n_shifts, "avg_target")
-            model.add(sum(shift_totals) == avg_target * len(shift_totals))
-            for i, total in enumerate(shift_totals):
+            if emp_vars: totals.append(sum(emp_vars))
+        if len(totals) > 1:
+            avg = model.new_int_var(0, n_dates * n_shifts, "avg_target")
+            model.add(sum(totals) == avg * len(totals))
+            for i, total in enumerate(totals):
                 excess = model.new_int_var(0, n_dates * n_shifts, f"excess_{i}")
-                model.add(excess >= total - avg_target)
-                model.add(excess >= avg_target - total)
+                model.add(excess >= total - avg)
+                model.add(excess >= avg - total)
                 objective.append(w_balance * excess)
             active_soft.append(f"balanceHours(w={w_balance})")
-            log(f"  [SOFT1] balanceHours: w={w_balance}, {len(shift_totals)} angajați")
+            log(f"  [SOFT1] balanceHours: w={w_balance}, {len(totals)} angajați, "
+                f"{len(totals)} termeni excess")
     else:
         log(f"  [SOFT1] balanceHours: DEZACTIVAT")
 
     # SOFT2: Evită ture noapte vineri/sâmbătă ─────────────────────────────────
-    nw_terms = 0
+    nw_cnt = 0
     if w_night_wknd > 0 and night_indices:
         for e_idx in range(n_employees):
             for d_idx, d in enumerate(working_dates):
@@ -509,54 +452,44 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
                     for s_idx in night_indices:
                         if (e_idx, d_idx, s_idx) in x:
                             objective.append(w_night_wknd * x[e_idx, d_idx, s_idx])
-                            nw_terms += 1
+                            nw_cnt += 1
         active_soft.append(f"avoidNightWeekend(w={w_night_wknd})")
-        log(f"  [SOFT2] avoidNightWeekend: w={w_night_wknd}, {nw_terms} variabile")
+        log(f"  [SOFT2] avoidNightWeekend: w={w_night_wknd}, {nw_cnt} variabile, "
+            f"max penalty={nw_cnt * w_night_wknd}")
     else:
         log(f"  [SOFT2] avoidNightWeekend: DEZACTIVAT")
 
     # SOFT3: Continuitate tură ────────────────────────────────────────────────
-    cont_terms = 0
+    cont_cnt = 0
     if w_continuity > 0 and n_shifts > 1:
         for e_idx in range(n_employees):
             for d_idx in range(1, n_dates):
                 for s_idx in range(n_shifts):
-                    if (e_idx, d_idx, s_idx) not in x:
-                        continue
+                    if (e_idx, d_idx, s_idx) not in x: continue
                     for s_prev in range(n_shifts):
-                        if s_prev == s_idx:
-                            continue
-                        if (e_idx, d_idx - 1, s_prev) not in x:
-                            continue
-                        changed = model.new_bool_var(
-                            f"chg_{e_idx}_{d_idx}_{s_idx}_{s_prev}"
-                        )
-                        model.add_bool_and([
-                            x[e_idx, d_idx, s_idx],
-                            x[e_idx, d_idx - 1, s_prev],
-                        ]).only_enforce_if(changed)
-                        model.add_bool_or([
-                            x[e_idx, d_idx, s_idx].negated(),
-                            x[e_idx, d_idx - 1, s_prev].negated(),
-                            changed,
-                        ])
+                        if s_prev == s_idx: continue
+                        if (e_idx, d_idx - 1, s_prev) not in x: continue
+                        changed = model.new_bool_var(f"chg_{e_idx}_{d_idx}_{s_idx}_{s_prev}")
+                        model.add_bool_and([x[e_idx, d_idx, s_idx],
+                                            x[e_idx, d_idx - 1, s_prev]]).only_enforce_if(changed)
+                        model.add_bool_or([x[e_idx, d_idx, s_idx].negated(),
+                                           x[e_idx, d_idx - 1, s_prev].negated(), changed])
                         objective.append(w_continuity * changed)
-                        cont_terms += 1
+                        cont_cnt += 1
         active_soft.append(f"shiftContinuity(w={w_continuity})")
-        log(f"  [SOFT3] shiftContinuity: w={w_continuity}, {cont_terms} variabile")
+        log(f"  [SOFT3] shiftContinuity: w={w_continuity}, {cont_cnt} variabile")
     else:
         log(f"  [SOFT3] shiftContinuity: DEZACTIVAT")
 
     # SOFT4: Zile libere consecutive ──────────────────────────────────────────
-    iso_terms = 0
+    iso_cnt = 0
     if w_days_off > 0 and n_dates >= 3:
         for e_idx in range(n_employees):
             for d_idx in range(1, n_dates - 1):
                 vp = [x[e_idx, d_idx-1, s] for s in range(n_shifts) if (e_idx, d_idx-1, s) in x]
                 vt = [x[e_idx, d_idx,   s] for s in range(n_shifts) if (e_idx, d_idx,   s) in x]
                 vn = [x[e_idx, d_idx+1, s] for s in range(n_shifts) if (e_idx, d_idx+1, s) in x]
-                if not (vp and vt and vn):
-                    continue
+                if not (vp and vt and vn): continue
                 wp = model.new_bool_var(f"wp_{e_idx}_{d_idx}")
                 wt = model.new_bool_var(f"wt_{e_idx}_{d_idx}")
                 wn = model.new_bool_var(f"wn_{e_idx}_{d_idx}")
@@ -570,37 +503,35 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
                 model.add_bool_and([wp, wt.negated(), wn]).only_enforce_if(isolated)
                 model.add_bool_or([wp.negated(), wt, wn.negated(), isolated])
                 objective.append(w_days_off * isolated)
-                iso_terms += 1
+                iso_cnt += 1
         active_soft.append(f"consecutiveDaysOff(w={w_days_off})")
-        log(f"  [SOFT4] consecutiveDaysOff: w={w_days_off}, {iso_terms} variabile")
+        log(f"  [SOFT4] consecutiveDaysOff: w={w_days_off}, {iso_cnt} variabile")
     else:
         log(f"  [SOFT4] consecutiveDaysOff: DEZACTIVAT")
 
-    # Coverage shortage — weight mare
     for shortage in coverage_penalties:
         objective.append(500 * shortage)
 
-    log(f"  Soft active: {active_soft if active_soft else ['none']}")
+    log(f"  Soft constraints active: {active_soft if active_soft else ['none']}")
     log(f"  Total termeni objective: {len(objective)}")
     log("=== END CONSTRAINTS SUMMARY ===")
 
     if objective:
         model.minimize(sum(objective))
-        log(f"model.minimize: {len(objective)} termeni")
+        log(f"  model.minimize: {len(objective)} termeni")
     else:
-        log("Fără objective — pure feasibility")
+        log("  Fără objective — pure feasibility")
 
     proto = model.proto
-    log(f"Model: {len(proto.variables)} variabile, {len(proto.constraints)} constrângeri")
+    log(f"  Model: {len(proto.variables)} variabile, {len(proto.constraints)} constrângeri")
 
-    # ── Pre-solve check ───────────────────────────────────────────────────────
+    # ── Pre-solve check — identic cu school ───────────────────────────────────
     log("=== PRE-SOLVE CHECK ===")
     total_needed = sum(effective_slots[s.id] for s in payload.shift_definitions) * n_dates
-    log(f"  Asignări necesare: {total_needed} total")
-
+    log(f"  Asignări necesare: {total_needed} total "
+        f"({n_shifts} ture × {n_dates} zile × media slots/zi)")
     for e_idx, emp in enumerate(payload.employees):
-        avail = sum(1 for d_idx in range(n_dates)
-                    for s_idx in range(n_shifts)
+        avail = sum(1 for d_idx in range(n_dates) for s_idx in range(n_shifts)
                     if (e_idx, d_idx, s_idx) in x)
         log(f"  [{emp.name}] {avail} sloturi disponibile "
             f"({'✓' if avail >= 1 else '✗ ZERO DISPONIBILITATE'})")
@@ -611,24 +542,21 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
     solver.parameters.num_search_workers  = 4
     solver.parameters.log_search_progress = False
 
-    log(f"Pornesc CP-SAT (timeout: {payload.solver_time_limit_seconds}s, "
-        f"workers: 4)...")
+    log(f"Pornesc CP-SAT (timeout: {payload.solver_time_limit_seconds}s, workers: 4)...")
     status      = solver.solve(model)
     status_name = solver.status_name(status)
     solve_time  = round(solver.wall_time, 2)
-    obj_val     = (solver.objective_value
-                   if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None)
+    obj_val     = solver.objective_value if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None
 
     log(f"Status: {status_name} în {solve_time}s, objective={obj_val}")
     debug_log.append({
-        "type":         "solver_status",
-        "status":       status_name,
+        "type": "solver_status", "status": status_name,
         "time_seconds": solve_time,
-        "feasible":     status in (cp_model.OPTIMAL, cp_model.FEASIBLE),
-        "objective":    obj_val,
+        "feasible": status in (cp_model.OPTIMAL, cp_model.FEASIBLE),
+        "objective": obj_val,
     })
 
-    # ── INFEASIBLE diagnosis ──────────────────────────────────────────────────
+    # ── INFEASIBLE ────────────────────────────────────────────────────────────
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         log("INFEASIBLE — analiză cauze...", "warn")
         reasons = _analyze_infeasibility(
@@ -637,26 +565,23 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
         )
         for r in reasons:
             log(f"  ► {r}", "warn")
-
         return ShiftsResponse(
             assignments=[],
             violations=[ShiftsViolation(type="infeasible", message=r) for r in reasons],
             stats=ShiftsStats(
                 total_slots=total_needed, filled_slots=0, unfilled_slots=total_needed,
-                solver_status=status_name, solve_time_seconds=solve_time,
-            ),
+                solver_status=status_name, solve_time_seconds=solve_time),
             debug_log=debug_log,
         )
 
-    # ── Extract assignments ───────────────────────────────────────────────────
+    # ── Extract ───────────────────────────────────────────────────────────────
     assignments: list[AssignmentResult] = []
-    filled_per: dict[tuple[int,int], int] = {}
+    filled_per: dict[tuple[int, int], int] = {}
 
     for e_idx, emp in enumerate(payload.employees):
         for d_idx, d in enumerate(working_dates):
             for s_idx, shift in enumerate(payload.shift_definitions):
-                if (e_idx, d_idx, s_idx) not in x:
-                    continue
+                if (e_idx, d_idx, s_idx) not in x: continue
                 if solver.value(x[e_idx, d_idx, s_idx]):
                     assignments.append(AssignmentResult(
                         employee_id=emp.id,
@@ -666,9 +591,9 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
                     key = (d_idx, s_idx)
                     filled_per[key] = filled_per.get(key, 0) + 1
 
-    # ── Post-solve validation ─────────────────────────────────────────────────
+    # ── Post-solve validation — identic cu school ────────────────────────────
     log("=== POST-SOLVE VALIDATION ===")
-    emp_day: dict[tuple[str,str], list[str]] = defaultdict(list)
+    emp_day: dict[tuple[str, str], list[str]] = defaultdict(list)
     for a in assignments:
         emp_day[(a.employee_id, a.date)].append(a.shift_definition_id)
     conflicts = {k: v for k, v in emp_day.items() if len(v) > 1}
@@ -676,32 +601,31 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
     if conflicts:
         for (eid, dt), sl in conflicts.items():
             ename = next((e.name for e in payload.employees if e.id == eid), eid[:8])
-            log(f"  ✗ CONFLICT {ename} pe {dt}: {sl}", "error")
+            log(f"  ANGAJAT CONFLICT {ename}: {dt}: {sl}", "error")
     else:
         log("  ✓ Niciun conflict angajat/zi detectat")
 
-    emp_counts: dict[str,int] = Counter(a.employee_id for a in assignments)
-    # Per-employee dates per shift — echivalentul sloturi din school
+    # Per-angajat distribuție — echivalentul teacher_result din school
     emp_shift_dates: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     for a in assignments:
         emp_shift_dates[a.employee_id][a.shift_definition_id].append(a.date)
 
-    log("  Distribuție ture/angajat:")
-    for emp in payload.employees:
+    emp_counts: dict[str, int] = Counter(a.employee_id for a in assignments)
+
+    for e_idx, emp in enumerate(payload.employees):
         cnt = emp_counts.get(emp.id, 0)
-        # Format similar cu school: "ShiftName: [date1, date2, ...]"
         shift_summary = []
         for shift in payload.shift_definitions:
             dates = emp_shift_dates[emp.id].get(shift.id, [])
             if dates:
                 shift_summary.append(f"{shift.name}:{len(dates)}z")
-        log(f"  [RESULT] {emp.name}: {cnt} ture → {', '.join(shift_summary) if shift_summary else 'nicio tură'}")
+        # Identic cu school: "teacher X: N lessons → [(day, period), ...]"
+        log(f"  {emp.name}: {cnt} ture → {', '.join(shift_summary) if shift_summary else 'nicio tură'}")
         debug_log.append({
-            "type":        "employee_result",
-            "employee_id": emp.id,
-            "name":        emp.name,
+            "type": "employee_result", "employee_id": emp.id, "name": emp.name,
             "assignments": cnt,
-            "by_shift":    {s.id: len(emp_shift_dates[emp.id].get(s.id, [])) for s in payload.shift_definitions},
+            "by_shift": {s.id: len(emp_shift_dates[emp.id].get(s.id, []))
+                         for s in payload.shift_definitions},
         })
 
     debug_log.append({"type": "distribution", "data": dict(emp_counts)})
@@ -719,56 +643,39 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
             if filled < required:
                 unfilled_slots += required - filled
                 violations.append(ShiftsViolation(
-                    type="unfilled_slot",
-                    date=d.isoformat(),
+                    type="unfilled_slot", date=d.isoformat(),
                     message=f"{d.isoformat()} / {shift.name}: {filled}/{required} angajați",
                     severity="warning",
                 ))
-                debug_log.append({
-                    "type":     "violation",
-                    "message":  f"{d.isoformat()} / {shift.name}: {filled}/{required}",
-                    "severity": "warning",
-                })
+                debug_log.append({"type": "violation",
+                                  "message": f"{d.isoformat()} / {shift.name}: {filled}/{required}",
+                                  "severity": "warning"})
 
-    for (eid, dt), sl in conflicts.items():
-        ename = next((e.name for e in payload.employees if e.id == eid), eid[:8])
-        violations.append(ShiftsViolation(
-            type="double_assignment", employee_id=eid, date=dt,
-            message=f"{ename} asignat la {len(sl)} ture pe {dt}",
-            severity="error",
-        ))
-
-    # ── Score breakdown ───────────────────────────────────────────────────────
+    # ── Score breakdown — identic cu school ──────────────────────────────────
     if obj_val is not None:
         log(f"  Objective value: {obj_val:.0f}")
-        by_shift: dict[str,int] = Counter(a.shift_definition_id for a in assignments)
+        by_shift: dict[str, int] = Counter(a.shift_definition_id for a in assignments)
         for shift in payload.shift_definitions:
             cnt    = by_shift.get(shift.id, 0)
             target = effective_slots[shift.id] * n_dates
             log(f"  [RESULT] {shift.name}: {cnt} asignări (target: {target}, "
-                f"{'✓ OK' if cnt >= target else f'⚠ minus {target-cnt}'})")
+                f"{'✓ OK' if cnt >= target else f'⚠ lipsesc {target - cnt}'})")
 
     debug_log.append({
-        "type":          "summary",
-        "total_slots":   total_slots,
-        "filled_slots":  len(assignments),
-        "unfilled_slots": unfilled_slots,
-        "violations":    len(violations),
+        "type": "summary", "total_slots": total_slots,
+        "filled_slots": len(assignments), "unfilled_slots": unfilled_slots,
+        "violations": len(violations),
     })
 
     log(f"=== Done: {len(assignments)} asignări, "
         f"{unfilled_slots} neacoperite, {len(violations)} violări ===")
 
     return ShiftsResponse(
-        assignments=assignments,
-        violations=violations,
+        assignments=assignments, violations=violations,
         stats=ShiftsStats(
-            total_slots=total_slots,
-            filled_slots=len(assignments),
-            unfilled_slots=unfilled_slots,
-            solver_status=status_name,
-            solve_time_seconds=solve_time,
-            objective_value=obj_val,
+            total_slots=total_slots, filled_slots=len(assignments),
+            unfilled_slots=unfilled_slots, solver_status=status_name,
+            solve_time_seconds=solve_time, objective_value=obj_val,
         ),
         debug_log=debug_log,
     )
@@ -776,18 +683,8 @@ def solve_shifts(payload: ShiftsRequest) -> ShiftsResponse:
 
 # ── Infeasibility analyzer ────────────────────────────────────────────────────
 
-def _analyze_infeasibility(
-    payload: ShiftsRequest,
-    working_dates: list[date],
-    n_dates: int,
-    n_shifts: int,
-    n_employees: int,
-    effective_slots: dict[str,int],
-    min_rest: float,
-    max_consecutive: int,
-    max_weekly_h: float,
-    x: dict,
-) -> list[str]:
+def _analyze_infeasibility(payload, working_dates, n_dates, n_shifts, n_employees,
+                            effective_slots, min_rest, max_consecutive, max_weekly_h, x):
     reasons = []
     total_needed = sum(effective_slots[s.id] for s in payload.shift_definitions) * n_dates
     total_avail  = len(x)
@@ -796,69 +693,28 @@ def _analyze_infeasibility(
         f"[SUMAR] {n_employees} angajați · {n_shifts} ture · {n_dates} zile · "
         f"{total_needed} asignări necesare · {total_avail} variabile disponibile"
     )
-
-    # Angajați fără nicio disponibilitate
     for e_idx, emp in enumerate(payload.employees):
-        avail = sum(1 for d_idx in range(n_dates)
-                    for s_idx in range(n_shifts)
+        avail = sum(1 for d_idx in range(n_dates) for s_idx in range(n_shifts)
                     if (e_idx, d_idx, s_idx) in x)
         if avail == 0:
-            reasons.append(
-                f"[ANGAJAT] {emp.name}: ZERO sloturi disponibile — "
-                f"concediu/indisponibilitate acoperă toată perioada"
-            )
-
-    # Acoperire imposibilă
+            reasons.append(f"[ANGAJAT] {emp.name}: ZERO sloturi — concediu/indisponibilitate acoperă toată perioada")
     if total_avail < total_needed:
-        reasons.append(
-            f"[ACOPERIRE] Max posibil={total_avail} < necesar={total_needed}. "
-            f"Adaugă angajați sau reduce slots/zi per tură."
-        )
-
-    # Repaus insuficient între ture
+        reasons.append(f"[ACOPERIRE] Max posibil={total_avail} < necesar={total_needed}. Adaugă angajați sau reduce slots/zi.")
     for i, s1 in enumerate(payload.shift_definitions):
         for j, s2 in enumerate(payload.shift_definitions):
-            if i == j:
-                continue
+            if i == j: continue
             rest = rest_hours_between(s1, s2)
             if 0 < rest < min_rest:
-                reasons.append(
-                    f"[REPAUS] {s1.name}→{s2.name}: {rest:.1f}h < {min_rest}h minim. "
-                    f"Angajații nu pot lucra aceste ture în zile consecutive."
-                )
-
-    # Ore/săpt prea mici față de durata turei
+                reasons.append(f"[REPAUS] {s1.name}→{s2.name}: {rest:.1f}h < {min_rest}h minim.")
     for shift in payload.shift_definitions:
         dur = shift_duration_hours(shift)
         if dur * 5 > max_weekly_h:
-            reasons.append(
-                f"[ORE] {shift.name} ({dur:.1f}h) × 5 zile = {dur*5:.0f}h > "
-                f"max_weekly_hours={max_weekly_h}h — angajații nu pot lucra zilnic."
-            )
-
-    # Max consecutive prea mic
-    if max_consecutive < 2:
-        reasons.append(
-            f"[CONSECUTIVE] max_consecutive_days={max_consecutive} prea mic. "
-            f"Angajații nu pot acoperi suficiente zile."
-        )
-
+            reasons.append(f"[ORE] {shift.name} ({dur:.1f}h) × 5 = {dur*5:.0f}h > max_weekly={max_weekly_h}h.")
     for e_idx, emp in enumerate(payload.employees):
-        total_h = sum(
-            shift_duration_hours(payload.shift_definitions[s_idx])
-            for d_idx in range(n_dates)
-            for s_idx in range(n_shifts)
-            if (e_idx, d_idx, s_idx) in x
-        )
-        reasons.append(
-            f"[ANGAJAT] {emp.name}: ore potențiale maxime = {total_h:.0f}h "
-            f"(din {sum(effective_slots[s.id] for s in payload.shift_definitions) * n_dates} necesare total)"
-        )
-
+        total_h = sum(shift_duration_hours(payload.shift_definitions[s_idx])
+                      for d_idx in range(n_dates) for s_idx in range(n_shifts)
+                      if (e_idx, d_idx, s_idx) in x)
+        reasons.append(f"[ANGAJAT] {emp.name}: ore potențiale maxime = {total_h:.0f}h")
     if len(reasons) <= 1:
-        reasons.append(
-            "[NECUNOSCUT] Cauza nu a putut fi determinată automat. "
-            "Verifică nr. angajați activi, slots/zi, concedii."
-        )
-
+        reasons.append("[NECUNOSCUT] Verifică nr. angajați activi, slots/zi, concedii.")
     return reasons
