@@ -1,95 +1,242 @@
-# orarpro-solver/main.py
-#
-# FastAPI microservice pentru generare orare — Google OR-Tools CP-SAT.
-#
-# Endpoints:
-#   GET  /health           — health check (Railway + Next.js wake-up)
-#   POST /solve/shifts     — orar ture business (horeca, fabrici, retail)
-#   POST /solve/business   — alias pentru /solve/shifts (compatibilitate)
-#   POST /solve/school     — orar școlar CP-SAT v4
-#
-# Deploy: Railway → railway up
-# Local:  uvicorn main:app --reload --port 8000
+// POST /api/schedules/[id]/generate — pipeline generare orar business:
+//   1. Încarcă angajați, ture, constrângeri, concedii, sărbători
+//   2. Apelează CP-SAT solver (/solve/business) — fallback la greedy dacă indisponibil
+//   3. Salvează asignările în shift_assignments
+//   4. Analiză AI opțională
+//   5. Update status + AI suggestions
+//   6. Audit log
+// Used by: ScheduleActions 'Generează' + ConstraintsPanel 'Salvează și regenerează'.
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import logging
+import { NextResponse } from 'next/server'
+import { createServerSupabaseClient, createAdminClient } from '@/lib/supabase/server'
+import { getOrgContext } from '@/lib/dal/org'
+import { generateSchedule } from '@/lib/algorithms/generate'
+import { analyzeScheduleWithAI } from '@/lib/ai/analyze'
+import { getHolidaysInRange } from '@/lib/holidays'
+import { addDays, format, parseISO } from 'date-fns'
 
-from solvers.business import solve_shifts, ShiftsRequest, ShiftsResponse
-from solvers.school   import solve_school,  SchoolRequest,  SchoolResponse
+const SOLVER_URL = process.env.SOLVER_URL
+console.log('[generate] SOLVER_URL:', SOLVER_URL ?? '(not set — will use greedy)')
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+function buildWorkingDates(schedule: any, holidays: any[]): string[] {
+  const dates: string[] = []
+  const holidaySet = new Set(holidays.map((h: any) => h.date))
+  let current = parseISO(schedule.start_date)
+  const end = parseISO(schedule.end_date)
+  while (current <= end) {
+    const dateStr = format(current, 'yyyy-MM-dd')
+    const dow = current.getDay() === 0 ? 7 : current.getDay()
+    const isWorkingDay = schedule.working_days?.includes(dow)
+    const skipHoliday = holidaySet.has(dateStr) && !schedule.include_holidays
+    if (isWorkingDay && !skipHoliday) dates.push(dateStr)
+    current = addDays(current, 1)
+  }
+  return dates
+}
 
-app = FastAPI(
-    title="OrarPro Solver",
-    description="CP-SAT schedule generation — Google OR-Tools",
-    version="3.0.0",
-)
+function shiftDurationHours(shift: any): number {
+  const [sh, sm] = shift.start_time.split(':').map(Number)
+  const [eh, em] = shift.end_time.split(':').map(Number)
+  let mins = (eh * 60 + em) - (sh * 60 + sm)
+  if (mins < 0) mins += 24 * 60
+  return mins / 60
+}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["POST", "GET"],
-    allow_headers=["*"],
-)
+async function callCpSatSolver(payload: any): Promise<any | null> {
+  if (!SOLVER_URL) return null
+  try {
+    const res = await fetch(`${SOLVER_URL}/solve/business`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(45_000),
+    })
+    if (!res.ok) {
+      console.error(`CP-SAT /solve/business returned ${res.status}:`, await res.text().catch(() => ''))
+      return null
+    }
+    return await res.json()
+  } catch (err: any) {
+    console.warn('CP-SAT solver unavailable — falling back to greedy:', err.message)
+    return null
+  }
+}
 
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params
+  const supabase = await createServerSupabaseClient()
+  const admin = createAdminClient()
 
-@app.get("/health")
-def health():
-    """Health check — Railway și Next.js wake-up call."""
-    return {"status": "ok", "solver": "OR-Tools CP-SAT", "version": "3.0.0"}
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
+  const ctx = await getOrgContext(user.id)
+  if (!ctx) return NextResponse.json({ error: 'No organization' }, { status: 400 })
+  const orgId = ctx.org.id
 
-@app.post("/solve/shifts", response_model=ShiftsResponse)
-async def solve_shifts_endpoint(payload: ShiftsRequest) -> ShiftsResponse:
-    """
-    Orar ture business (horeca, fabrici, retail, clinici) — CP-SAT v2.
-    Input:  employees, shift_definitions, working_dates, config, soft_rules.
-    Output: assignments[], violations[], stats, debug_log[].
-    """
-    logger.info(
-        f"/solve/shifts: {len(payload.employees)} angajați, "
-        f"{len(payload.shift_definitions)} ture, "
-        f"{len(payload.working_dates)} zile"
-    )
-    try:
-        return solve_shifts(payload)
-    except Exception as e:
-        logger.error(f"Shifts solver error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+  const empIds = (await admin.from('employees').select('id').eq('organization_id', orgId))
+    .data?.map((e: any) => e.id) ?? []
 
+  const [scheduleRes, employeesRes, shiftDefsRes, scheduleShiftsRes, constraintsRes, leavesRes, unavailRes] =
+    await Promise.all([
+      admin.from('schedules').select('*').eq('id', id).eq('organization_id', orgId).single(),
+      admin.from('employees').select('*').eq('organization_id', orgId).eq('is_active', true),
+      admin.from('shift_definitions').select('*').eq('organization_id', orgId),
+      admin.from('schedule_shifts').select('*').eq('schedule_id', id),
+      admin.from('constraints').select('*').eq('schedule_id', id).eq('is_active', true),
+      admin.from('employee_leaves').select('*').in('employee_id', empIds),
+      admin.from('employee_unavailability').select('*').in('employee_id', empIds),
+    ])
 
-@app.post("/solve/business", response_model=ShiftsResponse)
-async def solve_business_endpoint(payload: ShiftsRequest) -> ShiftsResponse:
-    """
-    Alias pentru /solve/shifts — compatibilitate cu generate-business/route.ts.
-    """
-    logger.info(
-        f"/solve/business (alias): {len(payload.employees)} angajați, "
-        f"{len(payload.shift_definitions)} ture"
-    )
-    try:
-        return solve_shifts(payload)
-    except Exception as e:
-        logger.error(f"Business solver error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+  const schedule = scheduleRes.data
+  if (!schedule) return NextResponse.json({ error: 'Schedule not found' }, { status: 404 })
 
+  await admin.from('schedules').update({ status: 'generating' }).eq('id', id)
 
-@app.post("/solve/school", response_model=SchoolResponse)
-async def solve_school_endpoint(payload: SchoolRequest) -> SchoolResponse:
-    """
-    Orar școlar CP-SAT v4 — class×subject model.
-    Input:  lessons[], teachers[], classes[], rooms[], soft_rules.
-    Output: timetable[], violations[], stats, debug_log[].
-    """
-    logger.info(
-        f"/solve/school: {len(payload.lessons)} lecții, "
-        f"{len(payload.classes)} clase, "
-        f"{payload.slots_per_day} sloturi/zi"
-    )
-    try:
-        return solve_school(payload)
-    except Exception as e:
-        logger.error(f"School solver error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+  const holidays = await getHolidaysInRange(schedule.country_code, schedule.start_date, schedule.end_date)
+
+  const slotsPerShift: Record<string, number> = {}
+  for (const ss of scheduleShiftsRes.data ?? []) slotsPerShift[ss.shift_definition_id] = ss.slots_per_day
+
+  const linkedShiftIds = new Set((scheduleShiftsRes.data ?? []).map((ss: any) => ss.shift_definition_id))
+  const shiftDefs = (shiftDefsRes.data ?? []).filter((s: any) => linkedShiftIds.has(s.id))
+  const gc = (schedule.generation_config as any) ?? {}
+  const workingDates = buildWorkingDates(schedule, holidays)
+
+  // ── Try CP-SAT solver (/solve/business) ──────────────────────────────────
+  let assignments: any[] = []
+  let violations: any[] = []
+  let stats: any = {}
+  let usedSolver = 'greedy'
+
+  if (SOLVER_URL) {
+    const solverResult = await callCpSatSolver({
+      schedule_id: id,
+      employees: (employeesRes.data ?? []).map((e: any) => ({
+        id: e.id, name: e.name, experience_level: e.experience_level, color: e.color,
+      })),
+      shift_definitions: shiftDefs.map((s: any) => ({
+        id: s.id, name: s.name,
+        shift_type: s.shift_type,
+        start_time: s.start_time,
+        end_time: s.end_time,
+        crosses_midnight: s.crosses_midnight ?? false,
+        duration_hours: shiftDurationHours(s),
+      })),
+      working_dates: workingDates,
+      slots_per_shift: slotsPerShift,
+      constraints: (constraintsRes.data ?? []).map((c: any) => ({
+        type: c.type, employee_id: c.employee_id,
+        target_employee_id: c.target_employee_id,
+        shift_definition_id: c.shift_definition_id,
+        value: c.value, note: c.note,
+        is_active: c.is_active,
+      })),
+      leaves: (leavesRes.data ?? []).map((l: any) => ({
+        employee_id: l.employee_id, start_date: l.start_date, end_date: l.end_date,
+      })),
+      unavailability: (unavailRes.data ?? []).map((u: any) => ({
+        employee_id: u.employee_id, date: u.date, day_of_week: u.day_of_week,
+      })),
+      config: {
+        min_employees_per_shift:       gc.min_employees_per_shift ?? 1,
+        max_consecutive_days:          gc.max_consecutive_days ?? 6,
+        min_rest_hours_between_shifts: gc.min_rest_hours_between_shifts ?? 11,
+        max_weekly_hours:              gc.max_weekly_hours ?? 48,
+        max_night_shifts_per_week:     gc.max_night_shifts_per_week ?? 3,
+        enforce_legal_limits:          gc.enforce_legal_limits ?? true,
+        balance_shift_distribution:    gc.balance_shift_distribution ?? true,
+        shift_consistency:             gc.shift_consistency ?? 2,
+      },
+      solver_time_limit_seconds: Math.min(
+        30,
+        Math.max(10, Math.ceil((employeesRes.data?.length ?? 1) * workingDates.length / 20))
+      ),
+    })
+
+    if (solverResult?.assignments?.length > 0) {
+      usedSolver = `cp-sat (${solverResult.stats?.solver_status ?? 'FEASIBLE'})`
+      assignments = solverResult.assignments.map((a: any) => ({
+        schedule_id: id,
+        employee_id: a.employee_id,
+        shift_definition_id: a.shift_definition_id,
+        date: a.date,
+        is_manual_override: false,
+        role_in_shift: null,
+        note: null,
+      }))
+      violations = (solverResult.violations ?? []).map((v: any) => ({
+        type: v.type, employeeId: v.employee_id, employeeName: v.employee_name,
+        date: v.date, message: v.message,
+      }))
+      stats = {
+        totalSlots: solverResult.stats?.total_slots ?? 0,
+        filledSlots: assignments.length,
+        hoursPerEmployee: solverResult.stats?.hours_per_employee ?? {},
+        solver: usedSolver,
+      }
+    }
+  }
+
+  // ── Fallback greedy ───────────────────────────────────────────────────────
+  if (assignments.length === 0) {
+    const result = generateSchedule({
+      schedule: schedule as any,
+      employees: employeesRes.data ?? [],
+      shiftDefinitions: shiftDefs as any,
+      constraints: constraintsRes.data as any ?? [],
+      leaves: leavesRes.data ?? [],
+      unavailability: unavailRes.data ?? [],
+      holidays,
+      slotsPerShift,
+    })
+    assignments = result.assignments as any[]
+    violations  = result.violations
+    stats       = { ...result.stats, solver: 'greedy' }
+    usedSolver  = 'greedy'
+  }
+
+  // ── Save assignments ──────────────────────────────────────────────────────
+  await admin.from('shift_assignments').delete().eq('schedule_id', id)
+  const BATCH = 100
+  for (let i = 0; i < assignments.length; i += BATCH) {
+    await admin.from('shift_assignments').insert(assignments.slice(i, i + BATCH))
+  }
+
+  // ── AI analysis (opțional) ────────────────────────────────────────────────
+  const locale = request.headers.get('accept-language')?.startsWith('ro') ? 'ro' : 'en'
+  let aiSuggestions = null
+  try {
+    aiSuggestions = await analyzeScheduleWithAI({
+      schedule: schedule as any,
+      assignments: assignments as any,
+      employees: employeesRes.data ?? [],
+      shiftDefinitions: shiftDefs as any,
+      constraints: constraintsRes.data as any ?? [],
+      violations,
+      locale,
+    })
+  } catch (err: any) {
+    console.warn('AI analysis skipped:', err.message)
+  }
+
+  await admin.from('schedules').update({
+    status: 'generated',
+    ai_suggestions: aiSuggestions,
+    ai_analyzed_at: new Date().toISOString(),
+  }).eq('id', id)
+
+  await admin.from('audit_log').insert({
+    user_id: user.id,
+    action: 'schedule_generate',
+    resource: 'schedule',
+    resource_id: id,
+    metadata: { filled_slots: assignments.length, violations: violations.length, solver: usedSolver },
+  })
+
+  console.log(`[generate] Done — solver: ${usedSolver}, assignments: ${assignments.length}`)
+  return NextResponse.json({ success: true, stats, violations, aiSuggestions, solver: usedSolver })
+}
